@@ -1,7 +1,8 @@
 import WatchConnectivity
 
 extension Notification.Name {
-    static let brokerURLUpdated = Notification.Name("brokerURLUpdated")
+    static let brokerURLUpdated   = Notification.Name("brokerURLUpdated")
+    static let newApprovalRequest = Notification.Name("newApprovalRequest")
 }
 
 class WatchSessionManager: NSObject, WCSessionDelegate {
@@ -43,5 +44,11 @@ class WatchSessionManager: NSObject, WCSessionDelegate {
         UserDefaults.standard.set(url, forKey: "brokerURL")
         NotificationCenter.default.post(name: .brokerURLUpdated, object: nil)
         print("[watch] broker URL updated: \(url)")
+    }
+
+    func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
+        if message["ping"] as? String == "newRequest" {
+            NotificationCenter.default.post(name: .newApprovalRequest, object: nil)
+        }
     }
 }

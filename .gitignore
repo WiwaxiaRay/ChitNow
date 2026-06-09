@@ -20,5 +20,12 @@ DerivedData/
 *.dSYM.zip
 *.dSYM
 
+# Xcode user data
+*.xcuserstate
+xcuserdata/
+
+# Claude Code local settings
+.claude/settings.local.json
+
 # macOS
 .DS_Store

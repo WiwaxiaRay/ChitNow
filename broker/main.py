@@ -70,7 +70,7 @@ async def init_db():
         # Expire requests that timed out while the broker was offline
         await db.execute(
             "UPDATE approval_requests SET status='expired' "
-            "WHERE status='pending' AND expires_at < datetime('now')"
+            "WHERE status='pending' AND datetime(expires_at) < datetime('now')"
         )
         await db.commit()
 
@@ -95,7 +95,7 @@ def _apns_auth_token() -> str:
 
 async def send_push(device_token: str, title: str, body: str, request_id: str):
     if not APNS_KEY_ID or not APNS_TEAM_ID:
-        print(f"[APNs] not configured — skipping push for {request_id}")
+        print(f"[APNs] not configured — skipping push for {request_id}", flush=True)
         return
     payload = {
         "aps": {
@@ -103,8 +103,10 @@ async def send_push(device_token: str, title: str, body: str, request_id: str):
             "category": "AGENT_APPROVAL",
             "sound": "default",
             "interruption-level": "time-sensitive",
+            "content-available": 1,
         },
         "request_id": request_id,
+        "type": "approval_request",
     }
     headers = {
         "authorization": f"bearer {_apns_auth_token()}",
@@ -112,15 +114,20 @@ async def send_push(device_token: str, title: str, body: str, request_id: str):
         "apns-push-type": "alert",
         "apns-priority": "10",
     }
-    async with httpx.AsyncClient(http2=True) as client:
-        resp = await client.post(
-            f"{APNS_HOST}/3/device/{device_token}",
-            json=payload,
-            headers=headers,
-            timeout=10,
-        )
-    if resp.status_code != 200:
-        print(f"[APNs] error {resp.status_code}: {resp.text}")
+    try:
+        async with httpx.AsyncClient(http2=True) as client:
+            resp = await client.post(
+                f"{APNS_HOST}/3/device/{device_token}",
+                json=payload,
+                headers=headers,
+                timeout=10,
+            )
+        if resp.status_code == 200:
+            print(f"[APNs] push sent: {request_id}", flush=True)
+        else:
+            print(f"[APNs] error {resp.status_code}: {resp.text}", flush=True)
+    except Exception as e:
+        print(f"[APNs] exception sending push for {request_id}: {e}", flush=True)
 
 
 # ── app ───────────────────────────────────────────────────────────────────────
@@ -594,7 +601,7 @@ async def pending_requests(x_api_key: str = Header("")):
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT * FROM approval_requests "
-            "WHERE status='pending' AND expires_at > datetime('now') "
+            "WHERE status='pending' AND datetime(expires_at) > datetime('now') "
             "ORDER BY created_at ASC"
         )
         rows = await cur.fetchall()

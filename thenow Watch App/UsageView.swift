@@ -187,7 +187,7 @@ struct WatchPageView: View {
     let stats: UsageStats?
     let requests: [ApprovalRequest]
     let error: String?
-    let onDecide: () -> Void
+    let onDecide: (String) -> Void
     let onRefresh: () -> Void
 
     @State private var now = Date()
@@ -217,31 +217,54 @@ struct WatchPageView: View {
         return "\(formatTokens(total))  ~$\(String(format: "%.2f", s.todayCost))"
     }
 
+    private func humanizeError(_ raw: String) -> String {
+        let e = raw.lowercased()
+        if e.contains("timeout") || e.contains("timed out") { return "请求超时了\n(¬_¬\")" }
+        if e.contains("connect") || e.contains("refused") || e.contains("unreachable") { return "连不上主机\n(´·ω·`)" }
+        if e.contains("offline") || e.contains("no route") { return "网络开小差了\n(・ω・？)" }
+        if raw == "connecting…" { return "连接中...\n(ﾉ´ヮ)ﾉ" }
+        return "出错了\n(⊙_⊙)"
+    }
+
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .top) {
                 Color.black.ignoresSafeArea()
 
-                // 底层：圆环 + 终端
+                // 底层：圆环 + 终端 / 错误气泡
                 VStack(spacing: 0) {
                     ringsView(width: geo.size.width)
                         .frame(maxWidth: .infinity)
                     Spacer(minLength: 2)
-                    terminal
+                    if stats == nil {
+                        MascotSpeech(
+                            message: humanizeError(error ?? "connecting…"),
+                            color: theme.accent
+                        )
                         .padding(.horizontal, 8)
                         .padding(.bottom, 14)
+                    } else {
+                        terminal
+                            .padding(.horizontal, 8)
+                            .padding(.bottom, 14)
+                    }
                 }
                 .offset(y: -35)
 
-                // 审批卡片悬浮在圆环上方
+                // 审批卡片垂直居中
                 if !requests.isEmpty {
-                    VStack(spacing: 4) {
-                        ForEach(requests) { req in
-                            PendingRequestCard(request: req, accent: theme.accent, onDecide: onDecide)
+                    VStack {
+                        Spacer()
+                        VStack(spacing: 4) {
+                            ForEach(requests) { req in
+                                PendingRequestCard(request: req, theme: theme, onDecide: onDecide)
+                            }
                         }
+                        .padding(.horizontal, 6)
+                        .offset(y: -45) // ← 改这里：负数往上，正数往下
+                        Spacer()
                     }
-                    .padding(.horizontal, 6)
-                    .padding(.top, 6)
+                    .frame(maxHeight: .infinity)
                 }
             }
         }
@@ -296,16 +319,11 @@ struct WatchPageView: View {
     // MARK: Terminal block
 
     private var terminal: some View {
-        let rows: [(key: String, val: String, col: Color)]
-        if let _ = stats {
-            rows = [
-                ("5-HR", fiveHrLabel, theme.ring5),
-                ("WEEK", weekLabel,   theme.ringW),
-                ("TKN ", tknLabel,    theme.sub),
-            ]
-        } else {
-            rows = [("···", error ?? "connecting…", theme.sub)]
-        }
+        let rows: [(key: String, val: String, col: Color)] = [
+            ("5-HR", fiveHrLabel, theme.ring5),
+            ("WEEK", weekLabel,   theme.ringW),
+            ("TKN ", tknLabel,    theme.sub),
+        ]
 
         return VStack(alignment: .leading, spacing: 5) {
             ForEach(Array(rows.enumerated()), id: \.offset) { i, row in
@@ -340,77 +358,173 @@ struct WatchPageView: View {
     }
 }
 
+// MARK: - Speech bubble (error display)
+
+private struct SpeechBubbleTriangle: Shape {
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        p.move(to: CGPoint(x: rect.midX, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        p.closeSubpath()
+        return p
+    }
+}
+
+private struct MascotSpeech: View {
+    let message: String
+    let color: Color
+
+    var body: some View {
+        VStack(spacing: 0) {
+            SpeechBubbleTriangle()
+                .fill(color.opacity(0.35))
+                .frame(width: 12, height: 6)
+            Text(message)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .multilineTextAlignment(.center)
+                .foregroundStyle(color)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity)
+                .background(
+                    RoundedRectangle(cornerRadius: 9)
+                        .fill(color.opacity(0.08))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 9)
+                                .stroke(color.opacity(0.40), lineWidth: 1)
+                        )
+                )
+        }
+    }
+}
+
 // MARK: - Pending request card
+
+private final class CardCountdown: ObservableObject {
+    @Published var remaining: Int
+    var onExpire: (() -> Void)?
+    private var cancellable: AnyCancellable?
+
+    init(initial: Int) {
+        remaining = initial
+        guard initial > 0 else { return }
+        cancellable = Timer.publish(every: 1, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in
+                guard let self, self.remaining > 0 else { return }
+                self.remaining -= 1
+                if self.remaining == 0 { self.onExpire?() }
+            }
+    }
+}
 
 struct PendingRequestCard: View {
     let request: ApprovalRequest
-    let accent: Color
-    let onDecide: () -> Void
+    let theme: WatchTheme
+    let onDecide: (String) -> Void
 
     @State private var deciding = false
     @State private var done = false
     @State private var failed = false
-    @State private var remaining: Int
-    private let countdown = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    @StateObject private var countdown: CardCountdown
 
-    init(request: ApprovalRequest, accent: Color, onDecide: @escaping () -> Void) {
+    init(request: ApprovalRequest, theme: WatchTheme, onDecide: @escaping (String) -> Void) {
         self.request  = request
-        self.accent   = accent
+        self.theme    = theme
         self.onDecide = onDecide
-        _remaining    = State(initialValue: request.remainingSeconds)
+        _countdown    = StateObject(wrappedValue: CardCountdown(initial: max(0, request.remainingSeconds - 165)))
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 6) {
+            // Header: 倒计时
             HStack {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.caption2).foregroundStyle(.orange)
-                Text("\(remaining)s").font(.caption2.monospacedDigit()).foregroundStyle(.orange)
+                Text(request.title)
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.6))
+                    .lineLimit(1)
                 Spacer()
-            }
-            Text(request.command)
-                .font(.system(.caption2, design: .monospaced))
-                .lineLimit(3)
-            if done {
-                Text("Sent ✓").font(.caption2).foregroundStyle(.secondary)
-            } else if failed {
-                Button { retry() } label: {
-                    Label("Retry", systemImage: "arrow.clockwise")
-                        .frame(maxWidth: .infinity)
+                HStack(spacing: 2) {
+                    Text("超时")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.5))
+                    Text("\(countdown.remaining)s")
+                        .font(.system(size: 11, weight: .bold, design: .monospaced).monospacedDigit())
+                        .foregroundStyle(countdown.remaining <= 10 ? Color.red : .white)
                 }
-                .buttonStyle(.bordered).tint(.orange)
-                .font(.caption2)
+            }
+
+            Divider().overlay(Color.white.opacity(0.2))
+
+            // 许可内容摘要
+            Text(request.summary)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // 原始命令
+            HStack(alignment: .top, spacing: 3) {
+                Text(">")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.5))
+                Text(request.command)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // 操作区
+            if done {
+                HStack {
+                    Spacer()
+                    Label("已发送", systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white)
+                    Spacer()
+                }
+            } else if deciding {
+                HStack { Spacer(); ProgressView().tint(.white); Spacer() }
+            } else if failed {
+                Button { failed = false } label: {
+                    Text("RETRY").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered).tint(.white)
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
             } else {
                 HStack(spacing: 6) {
-                    Button { decide(true) } label: { Text("✓").frame(maxWidth: .infinity) }
-                        .buttonStyle(.borderedProminent).tint(.green)
-                        .disabled(deciding || remaining == 0)
-                    Button { decide(false) } label: { Text("✕").frame(maxWidth: .infinity) }
-                        .buttonStyle(.bordered).tint(.red)
-                        .disabled(deciding || remaining == 0)
+                    Button { decide(true) } label: {
+                        Text("ALLOW").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent).tint(.white)
+                    .foregroundStyle(theme.ringW)
+                    .disabled(countdown.remaining == 0)
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+
+                    Button { decide(false) } label: {
+                        Text("DENY").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered).tint(.white)
+                    .disabled(countdown.remaining == 0)
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
                 }
             }
         }
-        .padding(7)
-        .background(Color.white.opacity(0.07))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .onReceive(countdown) { _ in if remaining > 0 { remaining -= 1 } }
+        .padding(10)
+        .background(theme.ringW)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .onAppear { countdown.onExpire = { [id = request.id] in onDecide(id) } }
     }
 
     private func decide(_ approved: Bool) {
         deciding = true
-        failed = false
         Task {
             let ok = await WatchBrokerClient.decide(request.id, approved: approved)
             await MainActor.run {
                 deciding = false
-                if ok { done = true; onDecide() } else { failed = true }
+                if ok { done = true; onDecide(request.id) } else { failed = true }
             }
         }
-    }
-
-    private func retry() {
-        failed = false
     }
 }
 

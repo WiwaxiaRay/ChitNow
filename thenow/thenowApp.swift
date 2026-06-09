@@ -56,15 +56,20 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
-        guard let brokerURL = userInfo["broker_url"] as? String else {
-            completionHandler(.noData)
+        if let brokerURL = userInfo["broker_url"] as? String {
+            print("[thenow] silent push: broker URL = \(brokerURL)")
+            if WCSession.isSupported() {
+                try? WCSession.default.updateApplicationContext(["brokerURL": brokerURL])
+            }
+            completionHandler(.newData)
             return
         }
-        print("[thenow] silent push: broker URL = \(brokerURL)")
-        if WCSession.isSupported() {
-            try? WCSession.default.updateApplicationContext(["brokerURL": brokerURL])
+        if userInfo["type"] as? String == "approval_request" {
+            PhoneSessionManager.shared.pingWatchNewRequest()
+            completionHandler(.newData)
+            return
         }
-        completionHandler(.newData)
+        completionHandler(.noData)
     }
 }
 
@@ -85,6 +90,13 @@ class PhoneSessionManager: NSObject, WCSessionDelegate {
 
     func sessionReachabilityDidChange(_ session: WCSession) {
         if session.isReachable { BrokerClient.discoverAndShareWithWatch() }
+    }
+
+    func pingWatchNewRequest() {
+        guard WCSession.isSupported(),
+              WCSession.default.activationState == .activated,
+              WCSession.default.isReachable else { return }
+        WCSession.default.sendMessage(["ping": "newRequest"], replyHandler: nil, errorHandler: nil)
     }
 
     // 手表主动来问时，后台自动回复当前 IP，不需要用户手动开 App
