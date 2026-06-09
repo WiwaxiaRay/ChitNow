@@ -1,0 +1,24 @@
+# Python
+broker/.venv/
+broker/__pycache__/
+broker/*.pyc
+
+# Runtime data
+broker/broker.log
+broker/broker.db
+broker/thenow.db
+
+# APNs private key — NEVER commit
+*.p8
+AuthKey_*
+
+# Xcode
+*.xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# macOS
+.DS_Store
