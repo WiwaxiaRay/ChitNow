@@ -75,9 +75,8 @@ private func loadCache() -> WidgetEntry? {
 // ── 网络请求 ───────────────────────────────────────────────────────────────────
 
 private func fetchEntry() async -> WidgetEntry {
-    let base  = await resolvedBrokerURL()
-    async let u = fetchUsage(base: base)
-    async let p = fetchPendingCount(base: base)
+    async let u = fetchUsage()
+    async let p = fetchPendingCount()
     let (usage, pending) = await (u, p)
     if usage == nil { return loadCache() ?? .empty }
     let entry = WidgetEntry(
@@ -92,32 +91,15 @@ private func fetchEntry() async -> WidgetEntry {
     return entry
 }
 
-/// mDNS を試して失敗したら /broker-ip で IP を解決して再試行する
-private func resolvedBrokerURL() async -> String {
-    // まず mDNS で試みる
-    if let url = URL(string: "\(BROKER_MDNS)/usage") {
-        var r = URLRequest(url: url); r.setValue(API_KEY, forHTTPHeaderField: "X-API-Key"); r.timeoutInterval = 4
-        if let _ = try? await URLSession.shared.data(for: r) { return BROKER_MDNS }
-    }
-    // mDNS 失敗 → /broker-ip で動的 IP を取得
-    if let ipURL = URL(string: "\(BROKER_MDNS)/broker-ip") {
-        var r = URLRequest(url: ipURL); r.setValue(API_KEY, forHTTPHeaderField: "X-API-Key"); r.timeoutInterval = 4
-        if let (data, _) = try? await URLSession.shared.data(for: r),
-           let obj = try? JSONDecoder().decode([String: String].self, from: data),
-           let url = obj["url"] { return url }
-    }
-    return BROKER_MDNS
-}
-
-private func fetchUsage(base: String) async -> UsageResp? {
-    guard let url = URL(string: "\(base)/usage") else { return nil }
+private func fetchUsage() async -> UsageResp? {
+    guard let url = URL(string: "\(BROKER_MDNS)/usage") else { return nil }
     var r = URLRequest(url: url); r.setValue(API_KEY, forHTTPHeaderField: "X-API-Key"); r.timeoutInterval = 8
     guard let (data, _) = try? await URLSession.shared.data(for: r) else { return nil }
     return try? JSONDecoder().decode(UsageResp.self, from: data)
 }
 
-private func fetchPendingCount(base: String) async -> Int {
-    guard let url = URL(string: "\(base)/pending-requests") else { return 0 }
+private func fetchPendingCount() async -> Int {
+    guard let url = URL(string: "\(BROKER_MDNS)/pending-requests") else { return 0 }
     var r = URLRequest(url: url); r.setValue(API_KEY, forHTTPHeaderField: "X-API-Key"); r.timeoutInterval = 8
     guard let (data, _) = try? await URLSession.shared.data(for: r),
           let items = try? JSONDecoder().decode([PendingItem].self, from: data) else { return 0 }

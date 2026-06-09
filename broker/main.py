@@ -36,6 +36,7 @@ APNS_HOST      = "https://api.push.apple.com"
 _waiters: dict[str, asyncio.Event] = {}
 _apns_token: str | None = None
 _apns_token_at: float = 0
+_apns_lock = asyncio.Lock()  # guards concurrent JWT regeneration
 
 
 # ── database ──────────────────────────────────────────────────────────────────
@@ -76,20 +77,24 @@ async def init_db():
 
 
 # ── APNs ──────────────────────────────────────────────────────────────────────
-def _apns_auth_token() -> str:
+async def _apns_auth_token() -> str:
     global _apns_token, _apns_token_at
     now = time.time()
     if _apns_token and now - _apns_token_at < 3000:
         return _apns_token
-    with open(APNS_KEY_PATH) as f:
-        key = f.read()
-    _apns_token = jwt.encode(
-        {"iss": APNS_TEAM_ID, "iat": int(now)},
-        key,
-        algorithm="ES256",
-        headers={"kid": APNS_KEY_ID},
-    )
-    _apns_token_at = now
+    async with _apns_lock:
+        # Re-check after acquiring lock — another coroutine may have refreshed it.
+        if _apns_token and now - _apns_token_at < 3000:
+            return _apns_token
+        with open(APNS_KEY_PATH) as f:
+            key = f.read()
+        _apns_token = jwt.encode(
+            {"iss": APNS_TEAM_ID, "iat": int(now)},
+            key,
+            algorithm="ES256",
+            headers={"kid": APNS_KEY_ID},
+        )
+        _apns_token_at = now
     return _apns_token
 
 
@@ -109,7 +114,7 @@ async def send_push(device_token: str, title: str, body: str, request_id: str):
         "type": "approval_request",
     }
     headers = {
-        "authorization": f"bearer {_apns_auth_token()}",
+        "authorization": f"bearer {await _apns_auth_token()}",
         "apns-topic": BUNDLE_ID,
         "apns-push-type": "alert",
         "apns-priority": "10",
@@ -164,7 +169,7 @@ async def _push_broker_url(broker_url: str, label: str = "push") -> None:
         "broker_url": broker_url,
     }
     headers = {
-        "authorization": f"bearer {_apns_auth_token()}",
+        "authorization": f"bearer {await _apns_auth_token()}",
         "apns-topic": BUNDLE_ID,
         "apns-push-type": "background",
         "apns-priority": "5",
@@ -193,10 +198,24 @@ async def _startup_push():
 
 
 async def _ip_monitor():
-    """每 60s 检测一次本机 IP，变化时主动推送新 broker URL。"""
+    """每 60s 检测 IP 变化；顺带清理 _waiters 中已无对应 pending 行的孤儿 event。"""
     last_ip: str | None = None
     while True:
         await asyncio.sleep(60)
+        # Clean up orphaned waiters (requests that expired while hook was disconnected)
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cur = await db.execute(
+                    "SELECT id FROM approval_requests WHERE status='pending'"
+                )
+                pending_ids = {row[0] for row in await cur.fetchall()}
+            stale = [k for k in list(_waiters) if k not in pending_ids]
+            for k in stale:
+                _waiters.pop(k, None)
+            if stale:
+                print(f"[ip monitor] cleaned {len(stale)} orphaned waiter(s)", flush=True)
+        except Exception:
+            pass
         ip = _current_ip()
         if ip is None:
             continue
@@ -580,7 +599,8 @@ async def health():
 
 
 @app.get("/broker-ip")
-async def broker_ip():
+async def broker_ip(x_api_key: str = Header("")):
+    auth(x_api_key)
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
