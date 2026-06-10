@@ -20,9 +20,11 @@ def _load_broker_config() -> tuple[str, str, str | None]:
     key  = os.environ.get("THENOW_API_KEY")
     cert = os.environ.get("THENOW_CERT_PATH")
     if not url or not key:
-        # Resolve config.json: relative to this script first, then common install paths
+        # Resolve config.json: env var first, then common install paths
         _script_dir = os.path.dirname(os.path.abspath(__file__))
         _candidates = [
+            p for p in [os.environ.get("THENOW_CONFIG_PATH")] if p
+        ] + [
             os.path.normpath(os.path.join(_script_dir, "..", "broker", "config.json")),
             os.path.expanduser("~/chitnow/broker/config.json"),
             os.path.expanduser("~/thenow/broker/config.json"),

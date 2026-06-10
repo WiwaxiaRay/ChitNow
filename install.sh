@@ -19,7 +19,13 @@ python3 -m venv .venv
 .venv/bin/pip install -q -r requirements.txt
 echo "    Done."
 
-# ── 2. launchd plist ───────────────────────────────────────────────────────────
+# ── 2. Generate config + certs (idempotent) ───────────────────────────────────
+echo "==> Generating broker config and TLS cert..."
+cd "$REPO/broker"
+.venv/bin/python generate_config.py
+echo "    Done."
+
+# ── 3. launchd plist ───────────────────────────────────────────────────────────
 echo "==> Installing launchd plist..."
 if launchctl list "$PLIST_LABEL" &>/dev/null; then
     launchctl unload "$PLIST_DST" 2>/dev/null || true
@@ -28,41 +34,50 @@ sed "s|REPO_PATH|$REPO|g" "$REPO/broker/com.wangyang.thenow-broker.plist" > "$PL
 launchctl load "$PLIST_DST"
 echo "    Broker started. Logs: $REPO/broker/broker.log"
 
-# ── 3. Hook script ─────────────────────────────────────────────────────────────
+# ── 4. Hook script ─────────────────────────────────────────────────────────────
 echo "==> Installing hook script..."
 mkdir -p "$HOOKS_DIR"
 cp "$REPO/hooks/thenow_hook.py" "$HOOKS_DIR/thenow_hook.py"
 chmod +x "$HOOKS_DIR/thenow_hook.py"
 echo "    Hook installed at $HOOKS_DIR/thenow_hook.py"
 
-# ── 4. Claude Code settings.json ──────────────────────────────────────────────
+# ── 5. Claude Code settings.json ──────────────────────────────────────────────
 echo "==> Wiring Claude Code PreToolUse hook..."
-HOOK_CMD="$REPO/broker/.venv/bin/python $HOOKS_DIR/thenow_hook.py"
+CONFIG_PATH="$REPO/broker/config.json"
+HOOK_CMD="env THENOW_CONFIG_PATH=$CONFIG_PATH $REPO/broker/.venv/bin/python $HOOKS_DIR/thenow_hook.py"
 
 if [ ! -f "$SETTINGS" ]; then
     mkdir -p "$(dirname "$SETTINGS")"
     echo '{}' > "$SETTINGS"
 fi
 
-# Use Python to safely merge the hook entry into settings.json
+# Merge hook entry into settings.json using the correct dict format
 python3 - "$SETTINGS" "$HOOK_CMD" <<'PYEOF'
 import json, sys
 path, cmd = sys.argv[1], sys.argv[2]
 with open(path) as f:
     cfg = json.load(f)
-hooks = cfg.setdefault("hooks", [])
 entry = {"matcher": "Bash", "hooks": [{"type": "command", "command": cmd}]}
-# Replace existing thenow hook if present, otherwise append
-for i, h in enumerate(hooks):
-    if "thenow_hook" in str(h):
-        hooks[i] = entry
-        break
-else:
-    hooks.append(entry)
-cfg["hooks"] = hooks
+hooks = cfg.setdefault("hooks", {})
+if isinstance(hooks, dict):
+    ptu = hooks.setdefault("PreToolUse", [])
+    for i, h in enumerate(ptu):
+        if "thenow_hook" in str(h):
+            ptu[i] = entry
+            break
+    else:
+        ptu.append(entry)
+elif isinstance(hooks, list):
+    # Legacy flat-list format
+    for i, h in enumerate(hooks):
+        if "thenow_hook" in str(h):
+            hooks[i] = entry
+            break
+    else:
+        hooks.append(entry)
 with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
-print(f"    settings.json updated.")
+print("    settings.json updated.")
 PYEOF
 
 # ── 5. Done ────────────────────────────────────────────────────────────────────
