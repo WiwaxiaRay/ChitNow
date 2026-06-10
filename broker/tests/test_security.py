@@ -106,6 +106,25 @@ class TestRotateBrokerCredentials:
         mod = _load_rotate()
         assert KNOWN_LEAKED_KEY in mod.KNOWN_LEAKED_KEYS
 
+    def test_rotate_preserves_relay_url(self, tmp_path):
+        """Rotating credentials must preserve relay_url in config.json."""
+        mod = _load_rotate()
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({
+            "api_key": KNOWN_LEAKED_KEY,
+            "relay_url": "https://relay.example.com",
+        }))
+        orig = mod.CONFIG_PATH
+        mod.CONFIG_PATH = str(cfg_path)
+        try:
+            mod._write_key("new-rotated-key")
+            data = json.loads(cfg_path.read_text())
+            assert data["api_key"] == "new-rotated-key"
+            assert data.get("relay_url") == "https://relay.example.com", \
+                "relay_url must be preserved after rotation"
+        finally:
+            mod.CONFIG_PATH = orig
+
 
 # ---------------------------------------------------------------------------
 # Log sanitisation tests
@@ -204,3 +223,23 @@ class TestScanSecrets:
             f"scan_secrets.sh crashed with exit {result.returncode}\n"
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
         )
+
+    def test_scan_no_false_positive_on_test_files(self):
+        """scan_secrets.sh must not flag broker/tests/ files as secret leaks.
+
+        These files legitimately reference the leaked key string for testing;
+        the scanner's exclusion list must cover them.
+        """
+        result = subprocess.run(
+            ["bash", str(SCRIPTS / "scan_secrets.sh")],
+            capture_output=True, text=True,
+            cwd=str(REPO),
+        )
+        # Check that test_security.py and test_broker.py are not mentioned as FAIL
+        # (They may appear in other scan output lines like [ok] or [WARN], but not [FAIL])
+        fail_lines = [l for l in result.stdout.splitlines() if l.strip().startswith("[FAIL]")]
+        for line in fail_lines:
+            assert "test_security" not in line, \
+                f"scan_secrets.sh falsely flagged test_security.py: {line}"
+            assert "test_broker" not in line, \
+                f"scan_secrets.sh falsely flagged test_broker.py: {line}"

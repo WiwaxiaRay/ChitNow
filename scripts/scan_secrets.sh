@@ -50,7 +50,11 @@ fi
 
 # ── 4. Known-leaked API key in TRACKED (git-indexed) files ───────────────────
 LEAKED_KEY="REDACTED_BROKER_API_KEY"
-TRACKED_WITH_KEY=$(git ls-files | grep -v "scan_secrets.sh\|rotate_broker_credentials.py\|test_security.py\|SECURITY-ROTATION.md" | \
+# Exclude: scripts/ (rotation/scan tools that reference the key legitimately),
+#          broker/tests/ (test fixtures that reference the key for testing),
+#          SECURITY-ROTATION.md (remediation documentation).
+TRACKED_WITH_KEY=$(git ls-files | \
+    grep -vE "^(scripts/|broker/tests/|SECURITY-ROTATION\.md)" | \
     xargs grep -l "$LEAKED_KEY" 2>/dev/null || true)
 if [ -n "$TRACKED_WITH_KEY" ]; then
     echo "$TRACKED_WITH_KEY" | while IFS= read -r f; do
