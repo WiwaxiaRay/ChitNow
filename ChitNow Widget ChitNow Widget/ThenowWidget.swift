@@ -2,18 +2,49 @@ import WidgetKit
 import SwiftUI
 
 // ── 配置 ───────────────────────────────────────────────────────────────────────
-private let API_KEY = "dev-key"
-private let APP_GROUP = "group.com.wangyang.thenow"
+import CryptoKit
 
-// Widget reads broker URL from the shared App Group written by the Watch App.
-// Falls back to localhost (simulator) or hardcoded IP (real device, first run).
+private let APP_GROUP = "group.com.wangyang.thenow"
+private let _shared   = UserDefaults(suiteName: APP_GROUP)
+
 private var BROKER_URL: String {
     #if targetEnvironment(simulator)
-    return "http://localhost:8000"
+    return "https://localhost:8000"
     #else
-    let shared = UserDefaults(suiteName: APP_GROUP)
-    return shared?.string(forKey: "brokerURL") ?? "http://172.30.87.117:8000"
+    return _shared?.string(forKey: "brokerURL") ?? "https://172.30.87.117:8000"
     #endif
+}
+private var API_KEY: String {
+    _shared?.string(forKey: "apiKey") ?? "dev-key"
+}
+private var CERT_FP: String? {
+    _shared?.string(forKey: "certFingerprint")
+}
+
+// Cert-pinning URLSession for widget network requests
+private func makePinnedSession() -> URLSession {
+    guard let fp = CERT_FP, !fp.isEmpty else { return URLSession.shared }
+    return URLSession(configuration: .default,
+                      delegate: WidgetPinnedDelegate(fingerprint: fp),
+                      delegateQueue: nil)
+}
+
+private final class WidgetPinnedDelegate: NSObject, URLSessionDelegate {
+    private let fp: String
+    init(fingerprint: String) { self.fp = fingerprint.lowercased() }
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let trust = challenge.protectionSpace.serverTrust,
+              let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate],
+              let leaf  = chain.first else {
+            completionHandler(.cancelAuthenticationChallenge, nil); return
+        }
+        let data = SecCertificateCopyData(leaf) as Data
+        let got  = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        completionHandler(got == fp ? .useCredential : .cancelAuthenticationChallenge,
+                          got == fp ? URLCredential(trust: trust) : nil)
+    }
 }
 
 // ── 像素宠物（5×5）B=身体 e=眼睛 .=空 ─────────────────────────────────────────
@@ -154,14 +185,14 @@ private func fetchEntry() async -> WidgetEntry {
 private func fetchUsage() async -> UsageResp? {
     guard let url = URL(string: "\(BROKER_URL)/usage") else { return nil }
     var r = URLRequest(url: url); r.setValue(API_KEY, forHTTPHeaderField: "X-API-Key"); r.timeoutInterval = 8
-    guard let (data, _) = try? await URLSession.shared.data(for: r) else { return nil }
+    guard let (data, _) = try? await makePinnedSession().data(for: r) else { return nil }
     return try? JSONDecoder().decode(UsageResp.self, from: data)
 }
 
 private func fetchPendingCount() async -> Int {
     guard let url = URL(string: "\(BROKER_URL)/pending-requests") else { return 0 }
     var r = URLRequest(url: url); r.setValue(API_KEY, forHTTPHeaderField: "X-API-Key"); r.timeoutInterval = 8
-    guard let (data, _) = try? await URLSession.shared.data(for: r),
+    guard let (data, _) = try? await makePinnedSession().data(for: r),
           let items = try? JSONDecoder().decode([PendingItem].self, from: data) else { return 0 }
     return items.count
 }

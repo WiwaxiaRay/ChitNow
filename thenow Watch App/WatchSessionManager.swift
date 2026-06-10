@@ -19,9 +19,10 @@ class WatchSessionManager: NSObject, WCSessionDelegate {
 
     func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {
         guard state == .activated else { return }
-        if let url = session.receivedApplicationContext["brokerURL"] as? String {
-            sharedDefaults.set(url, forKey: "brokerURL")
-        }
+        let ctx = session.receivedApplicationContext
+        if let url = ctx["brokerURL"]       as? String { sharedDefaults.set(url, forKey: "brokerURL") }
+        if let fp  = ctx["certFingerprint"] as? String { sharedDefaults.set(fp,  forKey: "certFingerprint") }
+        if let key = ctx["apiKey"]          as? String { sharedDefaults.set(key, forKey: "apiKey") }
         requestBrokerURLFromPhone(session)
     }
 
@@ -45,11 +46,14 @@ class WatchSessionManager: NSObject, WCSessionDelegate {
     }
 
     func session(_ session: WCSession, didReceiveApplicationContext context: [String: Any]) {
-        guard let url = context["brokerURL"] as? String else { return }
         DispatchQueue.main.async {
-            sharedDefaults.set(url, forKey: "brokerURL")
-            NotificationCenter.default.post(name: .brokerURLUpdated, object: nil)
-            print("[watch] broker URL updated: \(url)")
+            if let url = context["brokerURL"]       as? String { sharedDefaults.set(url, forKey: "brokerURL") }
+            if let fp  = context["certFingerprint"] as? String { sharedDefaults.set(fp,  forKey: "certFingerprint") }
+            if let key = context["apiKey"]          as? String { sharedDefaults.set(key, forKey: "apiKey") }
+            if context["brokerURL"] != nil {
+                NotificationCenter.default.post(name: .brokerURLUpdated, object: nil)
+                print("[watch] broker context updated")
+            }
         }
     }
 

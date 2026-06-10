@@ -6,6 +6,7 @@ Run: uvicorn main:app --port 8000
 import asyncio
 import json
 import os
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -16,14 +17,33 @@ import aiosqlite
 import httpx
 import jwt
 from fastapi import FastAPI, HTTPException, Header
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 # ── config ────────────────────────────────────────────────────────────────────
-_DIR           = os.path.dirname(os.path.abspath(__file__))
-DB_PATH        = os.path.join(_DIR, "broker.db")
-API_KEY        = os.environ.get("THENOW_API_KEY", "dev-key")
-TIMEOUT_SEC    = 180
+_DIR        = os.path.dirname(os.path.abspath(__file__))
+DB_PATH     = os.path.join(_DIR, "broker.db")
+TIMEOUT_SEC = 180
+
+def _load_api_key() -> str:
+    # Env var takes priority (dev override / Mac Helper sets it via launchd)
+    if os.environ.get("THENOW_API_KEY"):
+        return os.environ["THENOW_API_KEY"]
+    cfg_path = os.path.join(_DIR, "config.json")
+    try:
+        return json.loads(open(cfg_path).read())["api_key"]
+    except Exception:
+        return "dev-key"
+
+def _load_cert_fingerprint() -> str:
+    fp_path = os.path.join(_DIR, "certs", "fingerprint.txt")
+    try:
+        return open(fp_path).read().strip()
+    except Exception:
+        return ""
+
+API_KEY          = _load_api_key()
+CERT_FINGERPRINT = _load_cert_fingerprint()
 
 # Fill these after downloading APNs .p8 key from Apple Developer portal
 APNS_KEY_ID    = "ZRLVNRQ23Q"
@@ -192,7 +212,7 @@ async def _startup_push():
     await asyncio.sleep(2)
     ip = _current_ip()
     if ip:
-        await _push_broker_url(f"http://{ip}:8000", label="startup push")
+        await _push_broker_url(f"https://{ip}:8000", label="startup push")
     else:
         print("[startup push] cannot determine local IP", flush=True)
 
@@ -225,7 +245,7 @@ async def _ip_monitor():
         if ip != last_ip:
             last_ip = ip
             print(f"[ip monitor] IP changed → {ip}", flush=True)
-            await _push_broker_url(f"http://{ip}:8000", label="ip monitor")
+            await _push_broker_url(f"https://{ip}:8000", label="ip monitor")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -604,13 +624,13 @@ async def broker_ip(x_api_key: str = Header("")):
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80))   # UDP, no data sent — just resolves outbound interface
+        s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
     except Exception:
         ip = "127.0.0.1"
     finally:
         s.close()
-    return {"url": f"http://{ip}:8000"}
+    return {"url": f"https://{ip}:8000"}
 
 
 @app.get("/pending-requests")
@@ -646,3 +666,134 @@ async def audit_log(x_api_key: str = Header("")):
         )
         rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+# ── pairing ───────────────────────────────────────────────────────────────────
+# In-memory pairing sessions: sid → {payload, expires_at, used}
+_pairing_sessions: dict[str, dict] = {}
+
+
+def _current_https_url() -> str:
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return f"https://{ip}:8000"
+
+
+@app.get("/pair", response_class=HTMLResponse)
+async def pair_page():
+    """Open in browser on Mac. Shows a one-time QR code for iPhone to scan."""
+    # Expire stale sessions
+    now = time.time()
+    stale = [k for k, v in _pairing_sessions.items() if v["expires_at"] < now]
+    for k in stale:
+        _pairing_sessions.pop(k, None)
+
+    sid = secrets.token_hex(16)
+    expires_at = now + 300  # 5 minutes
+    payload = {
+        "v": 1,
+        "url": _current_https_url(),
+        "key": API_KEY,
+        "fp": CERT_FINGERPRINT,
+        "exp": int(expires_at),
+        "sid": sid,
+    }
+    _pairing_sessions[sid] = {"payload": payload, "expires_at": expires_at, "used": False}
+    payload_json = json.dumps(payload)
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>thenow — Pair iPhone</title>
+<style>
+  body {{ font-family: -apple-system, sans-serif; background: #1a1a1a; color: #f0f0f0;
+         display: flex; flex-direction: column; align-items: center;
+         justify-content: center; min-height: 100vh; margin: 0; padding: 24px; box-sizing: border-box; }}
+  h1  {{ font-size: 22px; margin-bottom: 4px; }}
+  p   {{ color: #999; font-size: 14px; margin: 0 0 24px; text-align: center; }}
+  #qr {{ background: #fff; padding: 16px; border-radius: 12px; }}
+  #timer {{ font-size: 13px; color: #888; margin-top: 16px; }}
+  #status {{ margin-top: 16px; font-size: 15px; color: #4ade80; display: none; }}
+</style>
+</head>
+<body>
+<h1>thenow</h1>
+<p>Open the thenow iPhone app and tap <b>Pair with Mac</b><br>then scan this code</p>
+<div id="qr"></div>
+<div id="timer">Expires in <span id="secs">300</span>s — <a href="/pair" style="color:#888">refresh</a></div>
+<div id="status">✓ Paired successfully</div>
+<script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
+<script>
+const data = {payload_json};
+QRCode.toCanvas(document.createElement('canvas'), JSON.stringify(data), {{
+  width: 260, margin: 2, color: {{ dark: '#000', light: '#fff' }}
+}}, function(err, canvas) {{
+  if (!err) document.getElementById('qr').appendChild(canvas);
+}});
+
+let secs = 300;
+const ticker = setInterval(() => {{
+  secs--;
+  const el = document.getElementById('secs');
+  if (el) el.textContent = secs;
+  if (secs <= 0) clearInterval(ticker);
+}}, 1000);
+
+// Poll until confirmed or expired
+const poll = setInterval(async () => {{
+  try {{
+    const r = await fetch('/pair/{sid}/status');
+    const j = await r.json();
+    if (j.status === 'confirmed') {{
+      clearInterval(poll);
+      clearInterval(ticker);
+      document.getElementById('timer').style.display = 'none';
+      document.getElementById('qr').style.opacity = '0.3';
+      document.getElementById('status').style.display = 'block';
+    }}
+  }} catch(_) {{}}
+}}, 2000);
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
+@app.post("/pair/{sid}/confirm")
+async def pair_confirm(sid: str, x_api_key: str = Header("")):
+    """Called by iPhone after scanning QR. x_api_key is validated against the scanned key."""
+    session = _pairing_sessions.get(sid)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    if session["used"]:
+        raise HTTPException(status_code=409, detail="Session already used")
+    if time.time() > session["expires_at"]:
+        _pairing_sessions.pop(sid, None)
+        raise HTTPException(status_code=410, detail="Session expired")
+    # Verify the scanned API key matches ours
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    session["used"] = True
+    print(f"[pair] iPhone confirmed pairing session {sid}", flush=True)
+    return {"status": "ok", "broker_url": session["payload"]["url"],
+            "cert_fp": session["payload"]["fp"]}
+
+
+@app.get("/pair/{sid}/status")
+async def pair_status(sid: str):
+    """Polled by the browser page to detect when iPhone has confirmed."""
+    session = _pairing_sessions.get(sid)
+    if not session:
+        return {"status": "expired"}
+    if time.time() > session["expires_at"]:
+        return {"status": "expired"}
+    return {"status": "confirmed" if session["used"] else "pending"}

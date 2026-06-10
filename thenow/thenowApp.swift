@@ -59,7 +59,10 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         if let brokerURL = userInfo["broker_url"] as? String {
             print("[thenow] silent push: broker URL = \(brokerURL)")
             if WCSession.isSupported() {
-                try? WCSession.default.updateApplicationContext(["brokerURL": brokerURL])
+                var ctx: [String: Any] = ["brokerURL": brokerURL]
+                if let fp = KeychainHelper.certFingerprint { ctx["certFingerprint"] = fp }
+                if let key = KeychainHelper.apiKey          { ctx["apiKey"] = key }
+                try? WCSession.default.updateApplicationContext(ctx)
             }
             completionHandler(.newData)
             return
