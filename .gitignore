@@ -1,7 +1,7 @@
 # Python
 broker/.venv/
-broker/__pycache__/
-broker/*.pyc
+**/__pycache__/
+**/*.pyc
 
 # Runtime data
 broker/broker.log
