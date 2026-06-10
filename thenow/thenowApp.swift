@@ -33,6 +33,14 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         return true
     }
 
+    func applicationDidBecomeActive(_ application: UIApplication) {
+        PhoneSessionManager.shared.startPolling()
+    }
+
+    func applicationWillResignActive(_ application: UIApplication) {
+        PhoneSessionManager.shared.stopPolling()
+    }
+
     func application(
         _ application: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
@@ -80,10 +88,42 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 class PhoneSessionManager: NSObject, WCSessionDelegate {
     static let shared = PhoneSessionManager()
 
+    private var pollTimer: Timer?
+    private var seenRequestIDs: Set<String> = []
+
     func activate() {
         guard WCSession.isSupported() else { return }
         WCSession.default.delegate = self
         WCSession.default.activate()
+    }
+
+    // Called when app enters foreground — polls broker and relays new requests to Watch.
+    // This makes Watch aware of new requests even without APNs configured.
+    func startPolling() {
+        guard pollTimer == nil else { return }
+        poll()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.poll()
+        }
+    }
+
+    func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+    }
+
+    private func poll() {
+        guard BrokerClient.isPaired else { return }
+        Task {
+            let ids = await BrokerClient.fetchPendingRequestIDs()
+            let idSet = Set(ids)
+            let newIDs = idSet.subtracting(seenRequestIDs)
+            if !newIDs.isEmpty {
+                seenRequestIDs.formUnion(newIDs)
+                pingWatchNewRequest()
+            }
+            seenRequestIDs = seenRequestIDs.intersection(idSet)
+        }
     }
 
     func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {

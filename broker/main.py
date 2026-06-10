@@ -700,7 +700,7 @@ def _current_https_url() -> str:
 @app.get("/pair", response_class=HTMLResponse)
 async def pair_page(request: Request):
     """Open in browser on Mac. Shows a one-time QR code for iPhone to scan."""
-    # Restrict to localhost — the QR payload contains the long-term API key
+    # Restrict to localhost
     client_host = request.client.host if request.client else ""
     if client_host not in ("127.0.0.1", "::1"):
         raise HTTPException(status_code=403, detail="Pairing page is only accessible from localhost")
@@ -710,17 +710,25 @@ async def pair_page(request: Request):
     for k in stale:
         _pairing_sessions.pop(k, None)
 
-    sid = secrets.token_hex(16)
-    expires_at = now + 300  # 5 minutes
+    sid          = secrets.token_hex(16)
+    pairing_token = secrets.token_hex(32)   # one-time token; API key never goes in the QR
+    expires_at   = now + 300  # 5 minutes
+    broker_url   = _current_https_url()
     payload = {
-        "v": 1,
-        "url": _current_https_url(),
-        "key": API_KEY,
-        "fp": CERT_FINGERPRINT,
+        "v": 2,
+        "url": broker_url,
+        "pt":  pairing_token,
+        "fp":  CERT_FINGERPRINT,
         "exp": int(expires_at),
         "sid": sid,
     }
-    _pairing_sessions[sid] = {"payload": payload, "expires_at": expires_at, "used": False}
+    _pairing_sessions[sid] = {
+        "pairing_token": pairing_token,
+        "url": broker_url,
+        "fp":  CERT_FINGERPRINT,
+        "expires_at": expires_at,
+        "used": False,
+    }
     payload_json = json.dumps(payload)
 
     html = f"""<!DOCTYPE html>
@@ -784,8 +792,8 @@ const poll = setInterval(async () => {{
 
 
 @app.post("/pair/{sid}/confirm")
-async def pair_confirm(sid: str, x_api_key: str = Header("")):
-    """Called by iPhone after scanning QR. x_api_key is validated against the scanned key."""
+async def pair_confirm(sid: str, x_pairing_token: str = Header("")):
+    """Called by iPhone after scanning QR. Returns api_key only after validating the one-time token."""
     session = _pairing_sessions.get(sid)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found or expired")
@@ -794,13 +802,16 @@ async def pair_confirm(sid: str, x_api_key: str = Header("")):
     if time.time() > session["expires_at"]:
         _pairing_sessions.pop(sid, None)
         raise HTTPException(status_code=410, detail="Session expired")
-    # Verify the scanned API key matches ours
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if x_pairing_token != session["pairing_token"]:
+        raise HTTPException(status_code=401, detail="Invalid pairing token")
     session["used"] = True
     print(f"[pair] iPhone confirmed pairing session {sid}", flush=True)
-    return {"status": "ok", "broker_url": session["payload"]["url"],
-            "cert_fp": session["payload"]["fp"]}
+    return {
+        "status":     "ok",
+        "api_key":    API_KEY,
+        "broker_url": session["url"],
+        "cert_fp":    session["fp"],
+    }
 
 
 @app.get("/pair/{sid}/status")

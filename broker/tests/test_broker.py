@@ -79,17 +79,21 @@ def test_pairing_session_single_use(client, monkeypatch):
     import secrets, time as _time
     sid = secrets.token_hex(8)
     session_key = secrets.token_hex(16)
+    pt = secrets.token_hex(32)
     broker_main._pairing_sessions[sid] = {
-        "payload": {"url": "https://192.168.1.1:8000", "fp": "aabbcc"},
+        "pairing_token": pt,
+        "url": "https://192.168.1.1:8000",
+        "fp":  "aabbcc",
         "expires_at": _time.time() + 300,
         "used": False,
     }
-    # First confirm should succeed
-    r = c.post(f"/pair/{sid}/confirm", headers={"X-API-Key": GOOD_KEY})
+    # First confirm should succeed and return api_key
+    r = c.post(f"/pair/{sid}/confirm", headers={"X-Pairing-Token": pt})
     assert r.status_code == 200
+    assert r.json()["api_key"] == GOOD_KEY
 
     # Second confirm on same session should fail (already used)
-    r2 = c.post(f"/pair/{sid}/confirm", headers={"X-API-Key": GOOD_KEY})
+    r2 = c.post(f"/pair/{sid}/confirm", headers={"X-Pairing-Token": pt})
     assert r2.status_code in (409, 410)
 
 
@@ -98,12 +102,15 @@ def test_pairing_session_expired(client):
     import secrets, time as _time
     sid = secrets.token_hex(8)
     session_key = secrets.token_hex(16)
+    pt = secrets.token_hex(32)
     broker_main._pairing_sessions[sid] = {
-        "payload": {"url": "https://192.168.1.1:8000", "fp": "aabbcc"},
+        "pairing_token": pt,
+        "url": "https://192.168.1.1:8000",
+        "fp":  "aabbcc",
         "expires_at": _time.time() - 1,   # already expired
         "used": False,
     }
-    r = c.post(f"/pair/{sid}/confirm", headers={"X-API-Key": GOOD_KEY})
+    r = c.post(f"/pair/{sid}/confirm", headers={"X-Pairing-Token": pt})
     assert r.status_code == 410
 
 

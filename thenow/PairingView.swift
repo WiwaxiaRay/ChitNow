@@ -6,10 +6,17 @@ import AVFoundation
 private struct PairingPayload: Decodable {
     let v:   Int
     let url: String
-    let key: String
+    let pt:  String   // one-time pairing token
     let fp:  String
     let exp: Int
     let sid: String
+}
+
+private struct ConfirmResponse: Decodable {
+    let status:     String
+    let api_key:    String
+    let broker_url: String
+    let cert_fp:    String
 }
 
 // MARK: - PairingView
@@ -74,8 +81,8 @@ struct PairingView: View {
             errorMsg = "Invalid QR code"
             return
         }
-        guard payload.v == 1 else {
-            errorMsg = "Unsupported pairing version"
+        guard payload.v == 2 else {
+            errorMsg = "Unsupported pairing version — refresh the Mac browser page"
             return
         }
         guard Int(Date().timeIntervalSince1970) < payload.exp else {
@@ -84,18 +91,16 @@ struct PairingView: View {
         }
         confirming = true
         Task {
-            let ok = await confirmWithBroker(payload: payload)
+            let resp = await confirmWithBroker(payload: payload)
             await MainActor.run {
                 confirming = false
-                if ok {
+                if let resp {
                     KeychainHelper.save(
-                        brokerURL:       payload.url,
-                        apiKey:          payload.key,
-                        certFingerprint: payload.fp
+                        brokerURL:       resp.broker_url,
+                        apiKey:          resp.api_key,
+                        certFingerprint: resp.cert_fp
                     )
-                    // Re-register APNs so the newly paired broker receives our token
                     UIApplication.shared.registerForRemoteNotifications()
-                    // Propagate to Watch
                     BrokerClient.discoverAndShareWithWatch()
                     onPaired()
                 } else {
@@ -105,17 +110,20 @@ struct PairingView: View {
         }
     }
 
-    private func confirmWithBroker(payload: PairingPayload) async -> Bool {
-        guard let url = URL(string: "\(payload.url)/pair/\(payload.sid)/confirm") else { return false }
+    private func confirmWithBroker(payload: PairingPayload) async -> ConfirmResponse? {
+        guard let url = URL(string: "\(payload.url)/pair/\(payload.sid)/confirm") else { return nil }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue(payload.key, forHTTPHeaderField: "X-API-Key")
+        req.setValue(payload.pt, forHTTPHeaderField: "X-Pairing-Token")
         req.timeoutInterval = 10
         let delegate = PinnedSessionDelegate(fingerprint: payload.fp)
         let session  = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
-        guard let (_, resp) = try? await session.data(for: req),
-              let http = resp as? HTTPURLResponse else { return false }
-        return http.statusCode == 200
+        guard let (data, resp) = try? await session.data(for: req),
+              let http = resp as? HTTPURLResponse,
+              http.statusCode == 200,
+              let result = try? JSONDecoder().decode(ConfirmResponse.self, from: data)
+        else { return nil }
+        return result
     }
 }
 

@@ -67,7 +67,10 @@ enum WatchBrokerClient {
 
     static func fetchPending() async -> [ApprovalRequest] {
         guard let req = makeRequest("/pending-requests") else { return [] }
-        guard let (data, _) = try? await makeSession().data(for: req) else { return [] }
+        guard let (data, _) = try? await makeSession().data(for: req) else {
+            WatchSessionManager.shared.requestFreshBrokerURL()
+            return []
+        }
         return (try? JSONDecoder().decode([ApprovalRequest].self, from: data)) ?? []
     }
 

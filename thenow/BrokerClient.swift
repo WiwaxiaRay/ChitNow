@@ -85,6 +85,18 @@ enum BrokerClient {
         return (true, Int(Date().timeIntervalSince(start) * 1000))
     }
 
+    static func fetchPendingRequestIDs() async -> [String] {
+        guard isPaired, let url = URL(string: "\(brokerURL)/pending-requests") else { return [] }
+        var req = URLRequest(url: url)
+        req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        req.timeoutInterval = 5
+        guard let (data, resp) = try? await makeSession().data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let items = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { return [] }
+        return items.compactMap { $0["id"] as? String }
+    }
+
     static func registerDevice(token: String) async {
         await post(path: "/register-device", body: ["device_token": token])
     }
