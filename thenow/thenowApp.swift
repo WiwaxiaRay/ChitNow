@@ -66,6 +66,13 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     ) {
         if let brokerURL = userInfo["broker_url"] as? String {
             print("[thenow] silent push: broker URL = \(brokerURL)")
+            // Update Keychain so iPhone's own requests use the new URL too.
+            // Without this, iPhone's /broker-ip call in didReceiveMessage would
+            // still use the stale URL and fail to answer Watch URL queries.
+            if let fp  = KeychainHelper.certFingerprint,
+               let key = KeychainHelper.apiKey {
+                KeychainHelper.save(brokerURL: brokerURL, apiKey: key, certFingerprint: fp)
+            }
             if WCSession.isSupported() {
                 var ctx: [String: Any] = ["brokerURL": brokerURL]
                 if let fp = KeychainHelper.certFingerprint { ctx["certFingerprint"] = fp }
