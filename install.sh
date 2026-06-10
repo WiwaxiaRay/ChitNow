@@ -54,11 +54,21 @@ echo "    Hook installed at $HOOKS_DIR/thenow_hook.py"
 # ── 5. Claude Code settings.json ──────────────────────────────────────────────
 echo "==> Wiring Claude Code PreToolUse hook..."
 CONFIG_PATH="$REPO/broker/config.json"
-# Use printf %q so paths containing spaces are safely shell-quoted.
-printf -v HOOK_CMD 'env THENOW_CONFIG_PATH=%q %q %q' \
-    "$CONFIG_PATH" \
-    "$REPO/broker/.venv/bin/python" \
-    "$HOOKS_DIR/thenow_hook.py"
+# Use Python to generate a TOML-safe command value.
+# printf %q produces shell-quoted strings (e.g. 'path with spaces') which are
+# NOT valid TOML strings. Python backslash-escapes for TOML/JSON compatibility.
+HOOK_CMD=$(python3 -c "
+import sys
+def toml_val(s):
+    return s.replace('\\\\', '\\\\\\\\').replace('\"', '\\\\\"')
+parts = [
+    'env',
+    'THENOW_CONFIG_PATH=' + toml_val(sys.argv[1]),
+    toml_val(sys.argv[2]),
+    toml_val(sys.argv[3]),
+]
+print(' '.join(parts))
+" "$CONFIG_PATH" "$REPO/broker/.venv/bin/python" "$HOOKS_DIR/thenow_hook.py")
 
 if [ ! -f "$SETTINGS" ]; then
     mkdir -p "$(dirname "$SETTINGS")"
@@ -108,10 +118,8 @@ print("    settings.json updated.")
 PYEOF
 
 # ── 6. Done ────────────────────────────────────────────────────────────────────
-printf -v CODEX_HOOK_CMD 'env THENOW_CONFIG_PATH=%q %q %q' \
-    "$CONFIG_PATH" \
-    "$REPO/broker/.venv/bin/python" \
-    "$HOOKS_DIR/thenow_hook.py"
+# CODEX_HOOK_CMD is the same as HOOK_CMD — already computed with TOML-safe escaping above.
+CODEX_HOOK_CMD="$HOOK_CMD"
 
 echo ""
 echo "==> Installation complete!"

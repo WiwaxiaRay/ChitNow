@@ -8,6 +8,10 @@
 #   Merge into ~/.codex/rules/default.rules (create if it doesn't exist).
 #   Then re-trust hooks in the Codex TUI: run /hooks and confirm.
 #
+# FORMAT: one pattern per line (plain prefix match or glob).
+#   Lines starting with '#' are comments and are ignored.
+#   Each non-comment line is matched as a prefix against the full command string.
+#
 # NOTE: ChitNow only receives commands that Codex routes here. Commands not
 # matched by these rules are executed directly without Watch approval.
 
@@ -26,9 +30,9 @@ git clean -fd
 git clean -f
 
 # Remote script execution via pipe
-curl.*\|\s*(ba)?sh
-wget.*\|\s*(ba)?sh
+curl
+wget
 
 # Overwrite system paths
->\ */etc/
->\ */usr/
+> /etc/
+> /usr/

@@ -228,18 +228,18 @@ def main():
     global _hook_event_name, _agent, _description
     command, cwd, agent, tool_name = _parse_input()
 
-    if not API_KEY:
-        print("[thenow] broker config not found — denying high-risk command", file=sys.stderr)
-        _log_debug("[main] API_KEY is None — denying")
-        _exit_deny("broker config not found")
-        return
-
-    # PermissionRequest (Codex): send all commands to Watch
-    # PreToolUse (Claude Code): only send high-risk commands
+    # Low-risk PreToolUse commands always pass through — no broker needed.
     if not command:
         _exit_passthrough()
     if _hook_event_name != "PermissionRequest" and not is_high_risk(command):
         _exit_passthrough()
+
+    # Beyond here: high-risk command or PermissionRequest.
+    if not API_KEY:
+        _log_debug("[main] API_KEY is None — denying high-risk command")
+        print("[thenow] broker config not found — denying high-risk command", file=sys.stderr)
+        _exit_deny("ChitNow broker not configured — install ChitNow first")
+        return
 
     summary = _description if _description else summarize(command)
     headers = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
