@@ -204,12 +204,11 @@ def _exit_deny(message: str = "") -> None:
             }
         }))
         sys.exit(0)
-    elif _agent == "codex":
-        # Codex PreToolUse: exit 2 = deny, exit 1 = hook error
-        sys.exit(2)
-    else:
-        # Claude Code PreToolUse: exit 1 = deny
-        sys.exit(1)
+    # All PreToolUse denials use exit 2.
+    # exit 1 means hook error (non-blocking in Claude Code); exit 2 blocks execution.
+    if message:
+        print(f"[thenow] denied: {message}", file=sys.stderr)
+    sys.exit(2)
 
 
 def main():
