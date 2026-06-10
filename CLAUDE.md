@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-**thenow** is an AI agent approval system. When Claude Code or Codex runs a high-risk shell command, a hook pauses execution, sends an APNs push notification, and waits for the user to approve or deny from their Apple Watch. The Watch App also displays Claude/ChatGPT quota and daily cost.
+**ChitNow** (repo: thenow) is an AI agent approval system. When Claude Code or Codex runs a high-risk shell command, a hook pauses execution, sends an APNs push notification, and waits for the user to approve or deny from their Apple Watch. The Watch App also displays Claude/ChatGPT quota and daily cost.
 
 Four components:
 
@@ -22,14 +22,21 @@ cd broker
 # First time
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# Run manually
-.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+# Run via run.sh (generates config + certs if missing, then starts uvicorn with TLS)
+bash run.sh
 
 # Managed by launchd (auto-starts on login, KeepAlive=true)
 launchctl load ~/Library/LaunchAgents/com.wangyang.thenow-broker.plist
 launchctl unload ~/Library/LaunchAgents/com.wangyang.thenow-broker.plist
 # Logs: broker/broker.log
 ```
+
+`run.sh` calls `generate_config.py` (idempotent) which creates:
+- `config.json` — random 64-char hex API key
+- `certs/broker.key` + `certs/broker.crt` — self-signed P-256 cert (SAN includes all LAN IPs)
+- `certs/fingerprint.txt` — SHA-256 cert fingerprint for pinning
+
+Both files are gitignored. The broker serves **HTTPS only** on port 8000.
 
 ### iOS + watchOS
 
@@ -64,14 +71,35 @@ hooks = true
 ```
 High-risk commands (sudo, rm, git push, git reset --hard) are forced into the PermissionRequest flow via `~/.codex/rules/default.rules`. The hook auto-detects the agent by checking whether `transcript_path` contains `.claude`.
 
-Test manually:
+The hook reads `broker/config.json` for the API key and uses `broker/certs/broker.crt` as the TLS verification cert (`verify=CERT_PATH` in httpx).
+
+Test manually (read API key from config.json first):
 ```bash
-curl -s -X POST http://localhost:8000/approval-requests \
-  -H "X-API-Key: dev-key" -H "Content-Type: application/json" \
+KEY=$(python3 -c "import json; print(json.load(open('broker/config.json'))['api_key'])")
+curl -sk -X POST https://localhost:8000/approval-requests \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
   -d '{"title":"Test","summary":"test","command":"rm -rf /tmp/x","agent":"claude-code"}'
 ```
 
 ## Architecture
+
+### Security model
+
+The broker uses **HTTPS + self-signed cert + cert pinning**. The pairing flow distributes credentials to the iPhone:
+
+```
+User opens https://localhost:8000/pair in browser
+  → broker generates one-time session {sid, key, url, fp, exp}
+  → QR code encodes the JSON payload
+iPhone scans QR → PairingView.swift
+  → POST /pair/{sid}/confirm (using PinnedSessionDelegate with scanned fp)
+  → stores {brokerURL, apiKey, certFingerprint} in iOS Keychain
+  → calls discoverAndShareWithWatch() → WCSession.updateApplicationContext
+Watch receives context → stores in App Group UserDefaults (group.com.wangyang.thenow)
+Widget reads from same App Group UserDefaults
+```
+
+All clients (iOS, Watch, Widget, hook) pin to the cert fingerprint. On fingerprint mismatch, `PinnedSessionDelegate` posts `Notification.Name.certMismatch` → iOS shows re-pair alert.
 
 ### Request flow
 
@@ -91,7 +119,7 @@ Apple Watch polls GET /pending-requests every 5s
 ### Broker (`broker/main.py`)
 
 - SQLite via `aiosqlite` — tables: `devices`, `approval_requests`, `audit_log`
-- APNs via `httpx` HTTP/2 + JWT (`PyJWT`). **Production** endpoint (`api.push.apple.com`). Auth key: `AuthKey_ZRLVNRQ23Q.p8`
+- APNs via `httpx` HTTP/2 + JWT (`PyJWT`). Endpoint controlled by `THENOW_APNS_ENV` env var: `sandbox` → `api.sandbox.push.apple.com`, `production` (default in launchd plist) → `api.push.apple.com`. Auth key: `AuthKey_ZRLVNRQ23Q.p8`
 - APNs JWT protected by `asyncio.Lock` (`_apns_lock`) to prevent concurrent regeneration
 - SSE waiting: in-memory `dict[str, asyncio.Event]` keyed by request ID; orphaned entries cleaned up every 60s in `_ip_monitor`
 - `GET /usage` reads codexbar cache files for token/cost data:
@@ -99,31 +127,32 @@ Apple Watch polls GET /pending-requests every 5s
   - `~/Library/Caches/codexbar/cost-usage/codex-v8.json` — daily GPT token rows
   - `~/Library/Application Support/com.steipete.codexbar/history/claude.json` — Claude quota
   - `~/Library/Application Support/com.steipete.codexbar/openai-dashboard.json` — GPT quota
-- `GET /broker-ip` returns `{"url": "http://<mac-lan-ip>:8000"}` — **requires auth** (same `X-API-Key` header)
+- `GET /broker-ip` returns `{"url": "https://<mac-lan-ip>:8000"}` — requires auth
 - `_ip_monitor` background task fires every 60s, pushes new broker URL via APNs on IP change
+- Pairing endpoints: `GET /pair` (HTML + QR), `POST /pair/{sid}/confirm`, `GET /pair/{sid}/status`
 
 ### iOS app (`thenow/`)
 
-- `thenowApp.swift` — `AppDelegate` registers for APNs, uploads device token to broker; `PhoneSessionManager` activates WCSession and replies to Watch broker-URL requests
-- `NotificationDelegate.swift` — handles `APPROVE`/`DENY` action identifiers from `AGENT_APPROVAL` category, POSTs decision to broker
-- `BrokerClient.swift` — uses mDNS hostname (`.local`); calls `GET /broker-ip` and pushes current Mac LAN IP to Watch via `WCSession.updateApplicationContext`
+- `KeychainHelper.swift` — stores/reads `brokerURL`, `apiKey`, `certFingerprint` from iOS Keychain (`kSecClassGenericPassword`)
+- `PairingView.swift` — QR scanner (`AVCaptureSession`), parses `PairingPayload`, calls `POST /pair/{sid}/confirm`, saves to Keychain on success
+- `BrokerClient.swift` — `PinnedSessionDelegate` pins TLS against stored fingerprint; posts `.certMismatch` notification on mismatch; `discoverAndShareWithWatch()` pushes all three credentials to Watch via `WCSession.updateApplicationContext`
+- `ContentView.swift` — switches between `PairingView` / `ActiveView`; shows cert-mismatch alert; `DiagnosticsView` sheet with live health check
+- `thenowApp.swift` — `AppDelegate` registers for APNs; `pingWatchNewRequest()` calls both `sendMessage` (foreground) and `transferUserInfo` (background-queued) for reliable Watch delivery
 
 ### Watch App (`thenow Watch App/`)
 
-- `WatchSessionManager.swift` — `WCSessionDelegate`; all WCSession callbacks dispatch to `DispatchQueue.main` before posting `NotificationCenter` events or writing `UserDefaults` (background-thread safety)
-- `WatchBrokerClient.swift` — reads `brokerURL` from `UserDefaults`; `#if targetEnvironment(simulator)` uses `localhost`; caches last successful `/usage` response for offline display
-- `ContentView.swift` — `TabView` (tag 0=Claude, tag 1=ChatGPT); new-request detection via `knownRequestIDs: Set<String>` inside `reloadApprovals()` on `MainActor` — fires haptic and navigates tab immediately when new IDs are detected; `dismissedIDs` prevents dismissed cards from reappearing on next poll
-- `UsageView.swift` — `WatchPageView` renders concentric rings + pixel mascot + terminal block; `PendingRequestCard` uses `CardCountdown: ObservableObject` (held in `@StateObject`) for a stable 1-second countdown — using `private let Timer` on a struct caused the timer to reset every time the parent re-rendered
-- `Models.swift` — `ApprovalRequest`, `UsageStats`, `QuotaInfo`, `UsageResponse`
+- `WatchSessionManager.swift` — `WCSessionDelegate`; reads `brokerURL`, `apiKey`, `certFingerprint` from incoming context; writes all three to `sharedDefaults` (App Group)
+- `WatchBrokerClient.swift` — reads credentials from `UserDefaults(suiteName: "group.com.wangyang.thenow")`; `WatchPinnedDelegate` pins TLS; `#if targetEnvironment(simulator)` uses `localhost`
+- `ContentView.swift` — `TabView` (tag 0=Claude, tag 1=ChatGPT); new-request detection via `knownRequestIDs: Set<String>`; `dismissedIDs` prevents reappearing cards
+- `UsageView.swift` — `PendingRequestCard` uses `CardCountdown: ObservableObject` (`@StateObject`) for stable countdown — struct-level Timer resets on re-render
 
 ### Widget (`ChitNow Widget ChitNow Widget/ThenowWidget.swift`)
 
-**Critical**: the Xcode target is `ChitNow Widget ChitNow WidgetExtension`. The directory `thenow Widget/` contains a file that is **not referenced by any target** — always edit `ChitNow Widget ChitNow Widget/ThenowWidget.swift`.
+**Critical**: always edit `ChitNow Widget ChitNow Widget/ThenowWidget.swift`. The directory `thenow Widget/` contains a dead file not in any build target.
 
-- watchOS complication supporting `.accessoryCircular` and `.accessoryRectangular`
-- Separate `ClaudeWidget` and `GPTWidget` structs sharing one `ThenowProvider`
-- `#if targetEnvironment(simulator)` → `localhost:8000`; real device → mDNS hostname
-- Requires `NSLocalNetworkUsageDescription` + `NSAppTransportSecurity/NSAllowsLocalNetworking` in `ChitNow Widget ChitNow Widget/Info.plist`
+- Reads `brokerURL`, `apiKey`, `certFingerprint` from `UserDefaults(suiteName: "group.com.wangyang.thenow")` (App Group shared with Watch App)
+- `WidgetPinnedDelegate` pins TLS; `makePinnedSession()` returns pinned session when fingerprint is available
+- `.accessoryCircular` and `.accessoryRectangular` complications; separate `ClaudeWidget` / `GPTWidget` sharing one `ThenowProvider`
 
 ### Key constants
 
@@ -133,19 +162,21 @@ Apple Watch polls GET /pending-requests every 5s
 | APNs Team ID | `F7PJZAN683` |
 | Bundle ID | `com.wangyang.thenow` |
 | Widget Bundle ID | `com.wangyang.thenow.watchkitapp.ChitNow-Widget-ChitNow-Widget` |
-| APNs env | production (`api.push.apple.com`) |
-| Broker port | `8000` |
+| App Group | `group.com.wangyang.thenow` |
+| APNs env | `THENOW_APNS_ENV` — `production` in launchd plist |
+| Broker port | `8000` (HTTPS) |
 | Hook timeout (PermissionRequest) | `15s` → falls back to Codex UI |
 | Hook timeout (PreToolUse) | `180s` → deny |
 | Watch poll interval | `5s` (approvals), `30s` (usage) |
+| Pairing session TTL | `300s` (5 min), one-time use |
 
 ## Common gotchas
 
-- **Wrong widget file**: `thenow Widget/ThenowWidget.swift` is a dead file not in any build target. The actual widget source is `ChitNow Widget ChitNow Widget/ThenowWidget.swift`.
-- **Watch broker URL**: Watch reads `UserDefaults["brokerURL"]` set by iPhone via WatchConnectivity. The fallback IP in `WatchBrokerClient.swift` is last-resort only — after a network change, the Watch recovers within ~60s as the IP monitor detects the change and pushes the new URL.
-- **mDNS on watchOS**: `.local` hostnames don't resolve reliably in watchOS `URLSession` — Watch always uses direct IP. mDNS is fine for iOS and widget (iPhone process).
-- **APNs BadDeviceToken**: Reopening the iOS app re-registers and uploads a fresh token. Occurs after app reinstall or provisioning changes.
-- **APNs provisioning**: Broker uses production APNs endpoint. Xcode direct-install (development profile) requires switching `APNS_HOST` in `broker/main.py` to `https://api.sandbox.push.apple.com`.
-- **Codex hook trust**: After editing `~/.codex/config.toml` hooks, re-trust via the `codex` CLI TUI (`/hooks`); the desktop app's panel is read-only.
+- **Wrong widget file**: `thenow Widget/ThenowWidget.swift` is dead. Edit `ChitNow Widget ChitNow Widget/ThenowWidget.swift`.
+- **APNs env**: launchd plist sets `THENOW_APNS_ENV=production`. Xcode direct-install (development profile) gets sandbox tokens — switch to `sandbox` or the push will fail with BadDeviceToken.
+- **Cert regeneration**: running `generate_config.py` or deleting `broker/certs/` creates a new cert with a new fingerprint. All paired clients will get `.certMismatch` and must re-pair by scanning the QR again.
+- **App Group entitlements**: Watch App and Widget both require `group.com.wangyang.thenow` in their `.entitlements` files and matching provisioning profiles. Missing entitlement = Widget shows stale/empty data.
+- **Watch broker URL**: Watch reads from App Group `UserDefaults["brokerURL"]`. Fallback IP in `WatchBrokerClient.swift` is last-resort — recovers within ~60s via IP monitor push.
+- **mDNS on watchOS**: `.local` hostnames don't resolve in watchOS `URLSession` — Watch and Widget always use direct IP.
+- **Codex hook trust**: After editing `~/.codex/config.toml`, re-trust via `codex` CLI TUI (`/hooks`); desktop app panel is read-only.
 - **Quota data stale**: codexbar must be running on Mac to refresh the JSON files the broker reads.
-- **`/broker-ip` requires auth**: All endpoints except `/health` require `X-API-Key` header — including `/broker-ip` (was unauthenticated before, now fixed).
