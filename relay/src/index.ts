@@ -7,20 +7,23 @@
  *
  * Endpoints:
  *   GET  /health
- *   POST /v1/installations/register
- *   POST /v1/installations/update-token
+ *   GET  /v1/challenge
+ *   POST /v1/register
+ *   POST /v1/update-token
  *   POST /v1/push
- *   POST /v1/installations/revoke
+ *   POST /v1/revoke
  */
 
 import {
   hmacSha256Hex,
   sha256Hex,
   safeEqual,
-  parsePushAuth,
-  verifyPushHmac,
   nowSecs,
   TIMESTAMP_TOLERANCE_SECS,
+  deriveRelaySecret,
+  canonicalMessage,
+  parseAuthHeaders,
+  type AuthHeaders,
 } from "./auth";
 import { sendApnsPush, type ApnsConfig } from "./apns";
 
@@ -35,6 +38,7 @@ const REG_RATE_WINDOW_SEC    = 3600;
 export interface Env {
   DB: D1Database;
   // Secrets set via `wrangler secret put`:
+  RELAY_MASTER_SECRET: string;
   APNS_PRIVATE_KEY: string;
   APNS_KEY_ID: string;
   APNS_TEAM_ID: string;
@@ -67,14 +71,35 @@ async function handleHealth(env: Env): Promise<Response> {
   return json({ status: "ok", apns_configured: apnsOk });
 }
 
-// ── POST /v1/installations/register ──────────────────────────────────────────
+// ── GET /v1/challenge ─────────────────────────────────────────────────────────
+// Issues a one-time registration challenge. Required before registering.
+
+async function handleChallenge(_req: Request, env: Env): Promise<Response> {
+  const challengeId = crypto.randomUUID();
+  const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  const now = nowSecs();
+  const expiresAt = now + 300; // 5 minutes
+
+  await env.DB.prepare(
+    "INSERT INTO reg_challenges (challenge_id, nonce, created_at) VALUES (?,?,?)"
+  ).bind(challengeId, nonce, now).run();
+
+  // Clean up expired challenges opportunistically
+  await env.DB.prepare("DELETE FROM reg_challenges WHERE created_at < ?")
+    .bind(now - 600).run();
+
+  return json({ challenge_id: challengeId, nonce, expires_at: expiresAt });
+}
+
+// ── POST /v1/register ─────────────────────────────────────────────────────────
 
 async function handleRegister(req: Request, env: Env): Promise<Response> {
   const ip = req.headers.get("cf-connecting-ip") ?? "unknown";
 
   // Basic IP-based rate limiting
   const windowStart = nowSecs() - REG_RATE_WINDOW_SEC;
-  // We track registrations in the push_log table with a special marker
   const recentRegs = await env.DB.prepare(
     "SELECT COUNT(*) as cnt FROM push_log WHERE installation_id=? AND pushed_at > ?",
   ).bind(`_reg_${ip}`, windowStart).first<{ cnt: number }>();
@@ -93,33 +118,47 @@ async function handleRegister(req: Request, env: Env): Promise<Response> {
   const b = body as Record<string, unknown>;
 
   // Validate required fields
-  const apnsToken = b.apns_device_token;
-  const challenge  = b.challenge;        // one-time challenge from GET /v1/challenge
+  const apnsToken   = b.apns_device_token;
+  const challengeId = b.challenge_id;
+  const nonce       = b.nonce;
+  const environment = b.environment;
+
   if (typeof apnsToken !== "string" || apnsToken.length < 32) {
     return json({ error: "missing apns_device_token" }, 400);
   }
-  if (typeof challenge !== "string") {
-    return json({ error: "missing challenge" }, 400);
+  if (typeof challengeId !== "string") {
+    return json({ error: "missing challenge_id" }, 400);
+  }
+  if (typeof nonce !== "string") {
+    return json({ error: "missing nonce" }, 400);
   }
 
   // Validate the challenge (must exist, be unused, and be < 5 minutes old)
   const chRow = await env.DB.prepare(
-    "SELECT created_at, used FROM reg_challenges WHERE challenge=?",
-  ).bind(challenge).first<{ created_at: number; used: number }>();
+    "SELECT nonce, created_at, used FROM reg_challenges WHERE challenge_id=?",
+  ).bind(challengeId).first<{ nonce: string; created_at: number; used: number }>();
   if (!chRow) return json({ error: "invalid_challenge" }, 403);
   if (chRow.used) return json({ error: "challenge_already_used" }, 409);
   if (nowSecs() - chRow.created_at > 300) return json({ error: "challenge_expired" }, 410);
 
-  // Mark challenge as used
-  await env.DB.prepare("UPDATE reg_challenges SET used=1 WHERE challenge=?")
-    .bind(challenge).run();
+  // Verify nonce matches what was issued
+  if (!safeEqual(chRow.nonce, nonce)) {
+    return json({ error: "invalid_nonce" }, 403);
+  }
+
+  // Atomically mark challenge as used (prevents TOCTOU)
+  const updateResult = await env.DB.prepare(
+    "UPDATE reg_challenges SET used=1 WHERE challenge_id=? AND used=0"
+  ).bind(challengeId).run();
+  if (updateResult.meta.changes === 0) {
+    return json({ error: "challenge_already_used" }, 409);
+  }
 
   // Generate installation credentials
   const installationId = crypto.randomUUID();
-  const relaySecret    = Array.from(crypto.getRandomValues(new Uint8Array(32)))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-  const secretHash = await sha256Hex(relaySecret);
+  // relay_secret is derived: HMAC-SHA256(RELAY_MASTER_SECRET, installationId)
+  const relaySecret = await deriveRelaySecret(env.RELAY_MASTER_SECRET, installationId);
+  const secretHash  = await sha256Hex(relaySecret);
   const now = nowSecs();
 
   await env.DB.prepare(
@@ -134,64 +173,74 @@ async function handleRegister(req: Request, env: Env): Promise<Response> {
   return json({ installation_id: installationId, relay_secret: relaySecret }, 201);
 }
 
-// ── GET /v1/challenge ─────────────────────────────────────────────────────────
-// Issues a one-time registration challenge. Required before registering.
+// ── Auth verification (shared) ────────────────────────────────────────────────
 
-async function handleChallenge(req: Request, env: Env): Promise<Response> {
-  const ip = req.headers.get("cf-connecting-ip") ?? "unknown";
-  const challenge = crypto.randomUUID();
-  const now = nowSecs();
-  await env.DB.prepare("INSERT INTO reg_challenges (challenge, created_at) VALUES (?,?)")
-    .bind(challenge, now).run();
-  // Clean up expired challenges opportunistically
-  await env.DB.prepare("DELETE FROM reg_challenges WHERE created_at < ?")
-    .bind(now - 600).run();
-  return json({ challenge });
-}
+/**
+ * Verify HMAC-based auth headers for authenticated endpoints.
+ * Returns error string on failure, null on success.
+ * The authHeaders must already be parsed; bodyText is the raw request body.
+ *
+ * Order:
+ *   1. Timestamp check (fast rejection)
+ *   2. Load installation
+ *   3. Verify HMAC
+ *   4. Atomically insert nonce (prevents replay)
+ */
+async function verifyAuth(
+  authHeaders: AuthHeaders,
+  bodyText: string,
+  method: string,
+  path: string,
+  env: Env,
+): Promise<string | null> {
+  // 1. Timestamp check
+  const drift = Math.abs(nowSecs() - authHeaders.timestamp);
+  if (drift > TIMESTAMP_TOLERANCE_SECS) return "timestamp_out_of_range";
 
-// ── POST /v1/installations/update-token ───────────────────────────────────────
+  // 2. Load installation
+  const inst = await env.DB.prepare(
+    "SELECT revoked_at FROM installations WHERE installation_id=?",
+  ).bind(authHeaders.installationId).first<{ revoked_at: number | null }>();
+  if (!inst) return "installation_not_found";
+  if (inst.revoked_at !== null) return "installation_revoked";
 
-async function handleUpdateToken(req: Request, env: Env): Promise<Response> {
-  let body: unknown;
-  try { body = await req.json(); } catch { return json({ error: "invalid_json" }, 400); }
-  if (typeof body !== "object" || body === null) return json({ error: "bad_request" }, 400);
-  const b = body as Record<string, unknown>;
+  // 3. Verify HMAC — derive relay_secret from master secret
+  const relaySecret = await deriveRelaySecret(env.RELAY_MASTER_SECRET, authHeaders.installationId);
+  const canonical   = await canonicalMessage(method, path, authHeaders.timestamp, authHeaders.nonce, bodyText);
+  const expected    = await hmacSha256Hex(relaySecret, canonical);
+  if (!safeEqual(expected, authHeaders.signature)) return "invalid_signature";
 
-  const claims = parsePushAuth(body);
-  if (!claims) return json({ error: "invalid_auth" }, 401);
-
-  const apnsToken = b.apns_device_token;
-  if (typeof apnsToken !== "string" || apnsToken.length < 32) {
-    return json({ error: "missing apns_device_token" }, 400);
+  // 4. Atomically insert nonce (throw on PRIMARY KEY violation = replayed)
+  try {
+    await env.DB.prepare(
+      "INSERT INTO used_nonces (nonce, installation_id, used_at) VALUES (?,?,?)",
+    ).bind(authHeaders.nonce, authHeaders.installationId, nowSecs()).run();
+  } catch {
+    return "nonce_replayed";
   }
 
-  const authErr = await verifyAuth(claims, env);
-  if (authErr) return json({ error: authErr }, 401);
-
-  await env.DB.prepare(
-    "UPDATE installations SET apns_device_token=?, last_seen_at=? WHERE installation_id=?",
-  ).bind(apnsToken, nowSecs(), claims.installation_id).run();
-
-  return json({ status: "ok" });
+  return null; // auth ok
 }
 
 // ── POST /v1/push ─────────────────────────────────────────────────────────────
 
 async function handlePush(req: Request, env: Env): Promise<Response> {
-  let body: unknown;
-  try { body = await req.json(); } catch { return json({ error: "invalid_json" }, 400); }
+  const authHeaders = parseAuthHeaders(req);
+  if (!authHeaders) return json({ error: "invalid_auth" }, 401);
 
-  const claims = parsePushAuth(body);
-  if (!claims) return json({ error: "invalid_auth" }, 401);
+  const bodyText = await req.text();
 
-  const authErr = await verifyAuth(claims, env);
-  if (authErr) return json({ error: authErr }, 401);
+  const authErr = await verifyAuth(authHeaders, bodyText, "POST", "/v1/push", env);
+  if (authErr) {
+    const status = (authErr === "nonce_replayed") ? 409 : 401;
+    return json({ error: authErr }, status);
+  }
 
   // Verify rate limit for this installation
   const windowStart = nowSecs() - PUSH_RATE_WINDOW_SEC;
   const pushCount = await env.DB.prepare(
     "SELECT COUNT(*) as cnt FROM push_log WHERE installation_id=? AND pushed_at > ?",
-  ).bind(claims.installation_id, windowStart).first<{ cnt: number }>();
+  ).bind(authHeaders.installationId, windowStart).first<{ cnt: number }>();
   if ((pushCount?.cnt ?? 0) >= PUSH_RATE_LIMIT) {
     return json({ error: "rate_limited" }, 429);
   }
@@ -199,24 +248,39 @@ async function handlePush(req: Request, env: Env): Promise<Response> {
   // Fetch device token
   const inst = await env.DB.prepare(
     "SELECT apns_device_token FROM installations WHERE installation_id=? AND revoked_at IS NULL",
-  ).bind(claims.installation_id).first<{ apns_device_token: string }>();
+  ).bind(authHeaders.installationId).first<{ apns_device_token: string }>();
   if (!inst) return json({ error: "installation_not_found" }, 404);
 
-  // Log push attempt before sending (prevents counting failures differently)
+  // Log push attempt before sending
   await env.DB.prepare("INSERT INTO push_log (installation_id, pushed_at) VALUES (?,?)")
-    .bind(claims.installation_id, nowSecs()).run();
+    .bind(authHeaders.installationId, nowSecs()).run();
 
   // Update last_seen_at
   await env.DB.prepare("UPDATE installations SET last_seen_at=? WHERE installation_id=?")
-    .bind(nowSecs(), claims.installation_id).run();
+    .bind(nowSecs(), authHeaders.installationId).run();
+
+  // Opportunistic cleanup (non-fatal)
+  try {
+    const cleanupBefore = nowSecs();
+    await env.DB.prepare("DELETE FROM reg_challenges WHERE created_at < ?")
+      .bind(cleanupBefore - 600).run();
+    await env.DB.prepare("DELETE FROM used_nonces WHERE used_at < ?")
+      .bind(cleanupBefore - 900).run();
+    await env.DB.prepare("DELETE FROM push_log WHERE pushed_at < ?")
+      .bind(cleanupBefore - 7200).run();
+  } catch {
+    // cleanup failure must never fail a push request
+  }
 
   // Send APNs push — generic payload only, no command/summary data
   const result = await sendApnsPush(inst.apns_device_token, apnsConfig(env));
   if (!result.ok) {
-    // Log sanitised error — never log device token or JWT
     console.log(`[push] APNs error ${result.status}: ${result.reason}`);
     if (result.status === 410) {
-      // BadDeviceToken / Unregistered — mark token as stale (update-token needed)
+      // BadDeviceToken / Unregistered — mark token as stale
+      await env.DB.prepare(
+        "UPDATE installations SET token_stale_at=? WHERE installation_id=?"
+      ).bind(nowSecs(), authHeaders.installationId).run();
       return json({ error: "device_token_invalid", hint: "call update-token" }, 422);
     }
     return json({ error: "push_failed", apns_status: result.status }, 502);
@@ -225,117 +289,77 @@ async function handlePush(req: Request, env: Env): Promise<Response> {
   return json({ status: "ok" });
 }
 
-// ── POST /v1/installations/revoke ─────────────────────────────────────────────
+// ── POST /v1/update-token ─────────────────────────────────────────────────────
 
-async function handleRevoke(req: Request, env: Env): Promise<Response> {
-  let body: unknown;
-  try { body = await req.json(); } catch { return json({ error: "invalid_json" }, 400); }
+async function handleUpdateToken(req: Request, env: Env): Promise<Response> {
+  const authHeaders = parseAuthHeaders(req);
+  if (!authHeaders) return json({ error: "invalid_auth" }, 401);
 
-  const claims = parsePushAuth(body);
-  if (!claims) return json({ error: "invalid_auth" }, 401);
+  const bodyText = await req.text();
 
-  const authErr = await verifyAuth(claims, env);
-  if (authErr) return json({ error: authErr }, 401);
+  const authErr = await verifyAuth(authHeaders, bodyText, "POST", "/v1/update-token", env);
+  if (authErr) {
+    const status = (authErr === "nonce_replayed") ? 409 : 401;
+    return json({ error: authErr }, status);
+  }
+
+  let b: Record<string, unknown>;
+  try {
+    b = JSON.parse(bodyText);
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const apnsToken = b.apns_device_token;
+  if (typeof apnsToken !== "string" || apnsToken.length < 32) {
+    return json({ error: "missing apns_device_token" }, 400);
+  }
 
   await env.DB.prepare(
-    "UPDATE installations SET revoked_at=? WHERE installation_id=?",
-  ).bind(nowSecs(), claims.installation_id).run();
+    "UPDATE installations SET apns_device_token=?, last_seen_at=?, token_stale_at=NULL WHERE installation_id=?",
+  ).bind(apnsToken, nowSecs(), authHeaders.installationId).run();
 
   return json({ status: "ok" });
 }
 
-// ── Auth verification (shared) ────────────────────────────────────────────────
+// ── POST /v1/revoke ───────────────────────────────────────────────────────────
 
-async function verifyAuth(
-  claims: ReturnType<typeof parsePushAuth>,
-  env: Env,
-): Promise<string | null> {
-  if (!claims) return "invalid_auth";
+async function handleRevoke(req: Request, env: Env): Promise<Response> {
+  const authHeaders = parseAuthHeaders(req);
+  if (!authHeaders) return json({ error: "invalid_auth" }, 401);
 
-  // 1. Timestamp check
-  const drift = Math.abs(nowSecs() - claims.timestamp);
-  if (drift > TIMESTAMP_TOLERANCE_SECS) return "timestamp_out_of_range";
+  const bodyText = await req.text();
 
-  // 2. Load installation
-  const inst = await env.DB.prepare(
-    "SELECT relay_secret_hash, revoked_at FROM installations WHERE installation_id=?",
-  ).bind(claims.installation_id).first<{ relay_secret_hash: string; revoked_at: number | null }>();
-  if (!inst) return "installation_not_found";
-  if (inst.revoked_at !== null) return "installation_revoked";
+  const authErr = await verifyAuth(authHeaders, bodyText, "POST", "/v1/revoke", env);
+  if (authErr) {
+    const status = (authErr === "nonce_replayed") ? 409 : 401;
+    return json({ error: authErr }, status);
+  }
 
-  // 3. Nonce replay check
-  const nonceRow = await env.DB.prepare(
-    "SELECT 1 FROM used_nonces WHERE nonce=? AND installation_id=?",
-  ).bind(claims.nonce, claims.installation_id).first();
-  if (nonceRow) return "nonce_replayed";
-
-  // 4. HMAC verification — we need the plain relay_secret, but only the hash is stored.
-  //    The broker sends: hmac = HMAC-SHA256(relay_secret, message)
-  //    We verify by computing: expected_hash = SHA256(relay_secret_from_claim)
-  //    But we don't have relay_secret — the broker must also send relay_secret_hash
-  //    OR we verify the HMAC by re-deriving from a known secret.
-  //
-  //    Architecture: the broker sends the HMAC computed with relay_secret.
-  //    We stored relay_secret_hash = SHA256(relay_secret).
-  //    We cannot verify HMAC without relay_secret.
-  //
-  //    Solution: the broker sends relay_secret in the request body (over HTTPS).
-  //    We compute SHA256(relay_secret_sent) and compare with stored hash,
-  //    then verify the HMAC. This is equivalent to password verification.
-  //
-  //    The body must include { relay_secret: "..." } for HMAC verification.
-  //    NOTE: this is safe because the Worker is HTTPS-only.
-  //
-  //    For the HMAC approach: derive expected HMAC from stored hash.
-  //    Since we can't "un-hash" the secret, the broker must include the secret
-  //    in the request. We hash it, compare with stored hash, then verify HMAC.
-  //
-  //    See verifyPushHmacFromHash() — the broker sends relay_secret in body.
-  //    This field is checked here; the rest of body validation is in handlePush.
-
-  // relay_secret must have been passed in as part of claims.
-  // parsePushAuth doesn't extract it; we need to re-read from the raw body.
-  // This is handled by callers who pass relay_secret alongside claims.
-  // For simplicity in this implementation, the HMAC IS the relay_secret verification:
-  //   compute SHA256 of the relay_secret extracted from body → compare with stored hash.
-  // This is done by requiring relay_secret_in_body in handlePush/handleRevoke/handleUpdateToken.
-
-  // Implementation note: this function is called after relay_secret has been
-  // extracted and passed alongside claims. See the `_relaySecret` field handling
-  // in the route handlers. For this initial implementation we use a simplified
-  // model where relay_secret itself is the auth credential (sent over HTTPS),
-  // and the HMAC adds a timestamp+nonce replay-prevention layer.
-
-  // Mark nonce as used (do this AFTER all checks pass)
   await env.DB.prepare(
-    "INSERT INTO used_nonces (nonce, installation_id, used_at) VALUES (?,?,?)",
-  ).bind(claims.nonce, claims.installation_id, nowSecs()).run();
+    "UPDATE installations SET revoked_at=? WHERE installation_id=?",
+  ).bind(nowSecs(), authHeaders.installationId).run();
 
-  // Clean up stale nonces opportunistically
-  await env.DB.prepare("DELETE FROM used_nonces WHERE used_at < ?")
-    .bind(nowSecs() - 600).run();
-
-  return null; // auth ok
+  return json({ status: "ok" });
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
-    const url = new URL(req.url);
+    const url    = new URL(req.url);
     const method = req.method.toUpperCase();
-    const path = url.pathname;
+    const path   = url.pathname;
 
     try {
-      if (method === "GET"  && path === "/health")                         return handleHealth(env);
-      if (method === "GET"  && path === "/v1/challenge")                   return handleChallenge(req, env);
-      if (method === "POST" && path === "/v1/installations/register")      return handleRegister(req, env);
-      if (method === "POST" && path === "/v1/installations/update-token")  return handleUpdateToken(req, env);
-      if (method === "POST" && path === "/v1/push")                        return handlePush(req, env);
-      if (method === "POST" && path === "/v1/installations/revoke")        return handleRevoke(req, env);
+      if (method === "GET"  && path === "/health")          return handleHealth(env);
+      if (method === "GET"  && path === "/v1/challenge")    return handleChallenge(req, env);
+      if (method === "POST" && path === "/v1/register")     return handleRegister(req, env);
+      if (method === "POST" && path === "/v1/push")         return handlePush(req, env);
+      if (method === "POST" && path === "/v1/update-token") return handleUpdateToken(req, env);
+      if (method === "POST" && path === "/v1/revoke")       return handleRevoke(req, env);
       return json({ error: "not_found" }, 404);
     } catch (err) {
-      // Log only sanitised error info — no secrets
       console.error(`[relay] unhandled error: ${err instanceof Error ? err.message : "unknown"}`);
       return json({ error: "internal_error" }, 500);
     }

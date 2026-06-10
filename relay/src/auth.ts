@@ -1,22 +1,30 @@
 /**
  * HMAC-SHA256 authentication helpers for ChitNow relay.
  *
- * Each installation has an independent relay_secret (32 random bytes, hex-encoded).
- * The secret is hashed with SHA-256 and only the hash is stored in D1.
+ * Each installation's relay_secret is DERIVED on demand:
+ *   relay_secret = HMAC-SHA256(RELAY_MASTER_SECRET, installation_id)
  *
- * Push requests are authenticated with a signed body:
- *   message  = installation_id + ":" + timestamp + ":" + nonce
- *   hmac     = HMAC-SHA256(relay_secret, message)   — hex
+ * Auth uses HTTP headers (canonical message signature):
+ *   canonical = METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + SHA256(BODY)
+ *   signature = HMAC-SHA256(relay_secret, canonical)
  *
- * The relay verifies:
- *   1. HMAC matches
- *   2. |now - timestamp| <= TIMESTAMP_TOLERANCE_SECS
- *   3. nonce has not been seen before for this installation
- *   4. Installation exists and is not revoked
+ * Headers:
+ *   X-ChitNow-Installation: <installation_id>
+ *   X-ChitNow-Timestamp:    <unix_seconds>
+ *   X-ChitNow-Nonce:        <random_hex_min_16_chars>
+ *   X-ChitNow-Signature:    <hmac_sha256_hex_64_chars>
+ *
+ * Verification order:
+ *   1. Check timestamp within tolerance
+ *   2. Load installation
+ *   3. Verify HMAC
+ *   4. Atomically insert nonce (fail = replayed)
+ *   5. Execute business logic
+ *
+ * Nonce is NEVER consumed if HMAC is invalid.
  */
 
 export const TIMESTAMP_TOLERANCE_SECS = 300; // 5 minutes
-const NONCE_TTL_SECS = 600;                  // clean up nonces older than 10 min
 
 export async function hmacSha256Hex(secret: string, message: string): Promise<string> {
   const enc = new TextEncoder();
@@ -50,40 +58,61 @@ export function safeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-export interface PushAuthClaims {
-  installation_id: string;
-  timestamp: number;   // unix seconds
-  nonce: string;       // random string, single-use
-  hmac: string;        // hex HMAC-SHA256
-}
-
-export function parsePushAuth(body: unknown): PushAuthClaims | null {
-  if (typeof body !== "object" || body === null) return null;
-  const b = body as Record<string, unknown>;
-  if (
-    typeof b.installation_id !== "string" ||
-    typeof b.timestamp !== "number" ||
-    typeof b.nonce !== "string" ||
-    typeof b.hmac !== "string"
-  ) return null;
-  if (b.nonce.length < 16 || b.nonce.length > 128) return null;
-  return {
-    installation_id: b.installation_id,
-    timestamp: b.timestamp,
-    nonce: b.nonce,
-    hmac: b.hmac,
-  };
-}
-
-export async function verifyPushHmac(
-  claims: PushAuthClaims,
-  relaySecret: string,
-): Promise<boolean> {
-  const message = `${claims.installation_id}:${claims.timestamp}:${claims.nonce}`;
-  const expected = await hmacSha256Hex(relaySecret, message);
-  return safeEqual(expected, claims.hmac);
-}
-
 export function nowSecs(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+/**
+ * Derive the relay_secret for an installation.
+ * relay_secret = HMAC-SHA256(masterSecret, installationId)
+ */
+export async function deriveRelaySecret(
+  masterSecret: string,
+  installationId: string,
+): Promise<string> {
+  return hmacSha256Hex(masterSecret, installationId);
+}
+
+/**
+ * Build the canonical message string for signature verification.
+ * canonical = METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + SHA256(BODY_TEXT)
+ */
+export async function canonicalMessage(
+  method: string,
+  path: string,
+  timestamp: number,
+  nonce: string,
+  bodyText: string,
+): Promise<string> {
+  const bodyHash = await sha256Hex(bodyText);
+  return `${method}\n${path}\n${timestamp}\n${nonce}\n${bodyHash}`;
+}
+
+export interface AuthHeaders {
+  installationId: string;
+  timestamp: number;
+  nonce: string;
+  signature: string;
+}
+
+/**
+ * Parse and validate the X-ChitNow-* auth headers from a request.
+ * Returns null if any required header is missing or invalid.
+ */
+export function parseAuthHeaders(req: Request): AuthHeaders | null {
+  const installationId = req.headers.get("X-ChitNow-Installation");
+  const timestampStr   = req.headers.get("X-ChitNow-Timestamp");
+  const nonce          = req.headers.get("X-ChitNow-Nonce");
+  const signature      = req.headers.get("X-ChitNow-Signature");
+
+  if (!installationId || !timestampStr || !nonce || !signature) return null;
+  if (installationId.length < 1) return null;
+
+  const timestamp = Number(timestampStr);
+  if (!Number.isInteger(timestamp) || timestamp <= 0) return null;
+
+  if (nonce.length < 16 || nonce.length > 256) return null;
+  if (signature.length !== 64 || !/^[0-9a-f]+$/.test(signature)) return null;
+
+  return { installationId, timestamp, nonce, signature };
 }

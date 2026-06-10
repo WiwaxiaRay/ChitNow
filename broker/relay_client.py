@@ -1,8 +1,8 @@
 """
 Relay client for ChitNow broker.
 
-Calls the Cloudflare Worker /v1/push endpoint using HMAC-SHA256 authentication.
-The Relay is responsible for forwarding a generic APNs push to the paired iPhone.
+Calls the Cloudflare Worker /v1/push endpoint using canonical HMAC-SHA256
+authentication via HTTP headers.
 
 The relay credentials (relay_url, installation_id, relay_secret) are stored in
 relay_credentials.json (600) alongside config.json. They are populated when the
@@ -43,17 +43,28 @@ def _hmac_sha256_hex(secret: str, message: str) -> str:
     return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
 
-def _build_auth_payload(installation_id: str, relay_secret: str) -> dict:
-    """Build the HMAC-signed auth fields for /v1/push."""
+def _sha256_hex(data: str) -> str:
+    return hashlib.sha256(data.encode()).hexdigest()
+
+
+def _build_auth_headers(
+    method: str,
+    path: str,
+    body_text: str,
+    installation_id: str,
+    relay_secret: str,
+) -> dict:
+    """Build X-ChitNow-* auth headers using the canonical message signature."""
     timestamp = int(time.time())
     nonce = secrets.token_hex(16)
-    message = f"{installation_id}:{timestamp}:{nonce}"
-    sig = _hmac_sha256_hex(relay_secret, message)
+    body_hash = _sha256_hex(body_text)
+    canonical = f"{method}\n{path}\n{timestamp}\n{nonce}\n{body_hash}"
+    sig = _hmac_sha256_hex(relay_secret, canonical)
     return {
-        "installation_id": installation_id,
-        "timestamp": timestamp,
-        "nonce": nonce,
-        "hmac": sig,
+        "X-ChitNow-Installation": installation_id,
+        "X-ChitNow-Timestamp":    str(timestamp),
+        "X-ChitNow-Nonce":        nonce,
+        "X-ChitNow-Signature":    sig,
     }
 
 
@@ -68,15 +79,23 @@ async def push_notification() -> bool:
     if not creds:
         return False
 
-    relay_url     = creds["relay_url"].rstrip("/")
+    relay_url       = creds["relay_url"].rstrip("/")
     installation_id = creds["installation_id"]
-    relay_secret  = creds["relay_secret"]
+    relay_secret    = creds["relay_secret"]
 
-    payload = _build_auth_payload(installation_id, relay_secret)
+    body_text = json.dumps({"event": "approval_pending"})
+    auth_headers = _build_auth_headers("POST", "/v1/push", body_text, installation_id, relay_secret)
 
     try:
         async with httpx.AsyncClient(timeout=RELAY_TIMEOUT) as client:
-            resp = await client.post(f"{relay_url}/v1/push", json=payload)
+            resp = await client.post(
+                f"{relay_url}/v1/push",
+                content=body_text,
+                headers={
+                    "Content-Type": "application/json",
+                    **auth_headers,
+                },
+            )
         if resp.status_code == 200:
             return True
         # Log sanitised error — never log relay_secret, installation_id value, or JWT

@@ -28,13 +28,13 @@ export const GENERIC_PAYLOAD = {
   aps: {
     alert: {
       title: "ChitNow",
-      body: "New approval request",
+      body: "New approval request — open ChitNow to review",
     },
     sound: "default",
-    category: "AGENT_APPROVAL",
+    "content-available": 1,
   },
   type: "approval_request",
-  // NO: request_id, command, summary, cwd, broker_url, api_key, cert_fp
+  // NO: request_id, command, summary, cwd, broker_url, api_key, cert_fp, category
 };
 
 /** APNs expiration: 30 seconds from now. Approval decisions are time-sensitive. */

@@ -8,12 +8,17 @@ import CryptoKit
 // pushes to the iPhone on behalf of the Mac broker.
 //
 // Registration flow:
-//   1. GET /v1/challenge              → nonce + challenge_id
-//   2. POST /v1/installations/register → installation_id + relay_secret
+//   1. GET /v1/challenge              → {challenge_id, nonce, expires_at}
+//   2. POST /v1/register              → {installation_id, relay_secret}
 //   3. Save both to Keychain; send to broker during pairing.
 //
 // Token refresh flow (APNs token rotated by iOS):
-//   POST /v1/installations/update-token  (HMAC-authenticated)
+//   POST /v1/update-token  (header-based HMAC auth)
+//
+// Auth uses canonical message:
+//   canonical = METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + SHA256(BODY)
+//   signature = HMAC-SHA256(relay_secret, canonical)
+// Headers: X-ChitNow-Installation, X-ChitNow-Timestamp, X-ChitNow-Nonce, X-ChitNow-Signature
 
 enum RelayClient {
 
@@ -54,20 +59,21 @@ enum RelayClient {
         guard let challengeURL = URL(string: "\(base)/v1/challenge") else { return nil }
         guard let (chalData, chalResp) = try? await URLSession.shared.data(from: challengeURL),
               (chalResp as? HTTPURLResponse)?.statusCode == 200,
-              let chalJSON = try? JSONDecoder().decode([String: String].self, from: chalData),
-              let nonce = chalJSON["nonce"],
-              let challengeId = chalJSON["challenge_id"]
+              let chalJSON = try? JSONDecoder().decode([String: AnyCodable].self, from: chalData),
+              let challengeId = chalJSON["challenge_id"]?.stringValue,
+              let nonce = chalJSON["nonce"]?.stringValue
         else {
             print("[relay] challenge request failed")
             return nil
         }
 
-        // Step 2: register
-        guard let regURL = URL(string: "\(base)/v1/installations/register") else { return nil }
+        // Step 2: register — 201 response with installation_id and relay_secret
+        guard let regURL = URL(string: "\(base)/v1/register") else { return nil }
         let body: [String: String] = [
-            "device_token": deviceToken,
-            "nonce":        nonce,
-            "challenge_id": challengeId,
+            "apns_device_token": deviceToken,
+            "challenge_id":      challengeId,
+            "nonce":             nonce,
+            "environment":       "production",
         ]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
         var req = URLRequest(url: regURL)
@@ -77,7 +83,7 @@ enum RelayClient {
         req.timeoutInterval = 10
 
         guard let (regData, regResp) = try? await URLSession.shared.data(for: req),
-              (regResp as? HTTPURLResponse)?.statusCode == 200,
+              (regResp as? HTTPURLResponse)?.statusCode == 201,
               let regJSON = try? JSONDecoder().decode([String: String].self, from: regData),
               let installationId = regJSON["installation_id"],
               let relaySecret    = regJSON["relay_secret"]
@@ -95,17 +101,30 @@ enum RelayClient {
     // MARK: Update token
 
     private static func updateToken(deviceToken: String, credentials: Credentials) async -> Bool {
-        guard let url = URL(string: "\(credentials.relayURL)/v1/installations/update-token") else { return false }
-        let auth = buildHmacPayload(installationId: credentials.installationId,
-                                    relaySecret: credentials.relaySecret)
-        var body = auth
-        body["device_token"] = deviceToken
-        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return false }
+        guard let url = URL(string: "\(credentials.relayURL)/v1/update-token") else { return false }
+        let bodyDict: [String: String] = [
+            "apns_device_token": deviceToken,
+            "environment":       "production",
+        ]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: bodyDict) else { return false }
+        let bodyText = String(data: bodyData, encoding: .utf8) ?? "{}"
+
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = bodyData
         req.timeoutInterval = 10
+
+        let authHeaders = buildAuthHeaders(
+            method: "POST", path: "/v1/update-token",
+            bodyData: bodyData,
+            installationId: credentials.installationId,
+            relaySecret: credentials.relaySecret
+        )
+        for (k, v) in authHeaders {
+            req.setValue(v, forHTTPHeaderField: k)
+        }
+
         guard let (_, resp) = try? await URLSession.shared.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200
         else {
@@ -121,32 +140,51 @@ enum RelayClient {
     /// Revoke relay credentials (called on unpair / data delete).
     static func revoke() async {
         guard let creds = storedCredentials(for: KeychainHelper.relayURL ?? "") else { return }
-        guard let url = URL(string: "\(creds.relayURL)/v1/installations/revoke") else { return }
-        var body = buildHmacPayload(installationId: creds.installationId,
-                                    relaySecret: creds.relaySecret)
-        body["installation_id"] = creds.installationId
-        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return }
+        guard let url = URL(string: "\(creds.relayURL)/v1/revoke") else { return }
+        let bodyDict: [String: String] = [:]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: bodyDict) else { return }
+
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = bodyData
         req.timeoutInterval = 10
+
+        let authHeaders = buildAuthHeaders(
+            method: "POST", path: "/v1/revoke",
+            bodyData: bodyData,
+            installationId: creds.installationId,
+            relaySecret: creds.relaySecret
+        )
+        for (k, v) in authHeaders {
+            req.setValue(v, forHTTPHeaderField: k)
+        }
+
         _ = try? await URLSession.shared.data(for: req)
         print("[relay] revoked installation: \(creds.installationId.prefix(8))…")
     }
 
-    // MARK: HMAC auth payload
+    // MARK: Canonical auth headers
 
-    private static func buildHmacPayload(installationId: String, relaySecret: String) -> [String: Any] {
+    /// Build X-ChitNow-* auth headers using the canonical message signature scheme.
+    /// canonical = METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + SHA256(BODY)
+    static func buildAuthHeaders(
+        method: String,
+        path: String,
+        bodyData: Data,
+        installationId: String,
+        relaySecret: String
+    ) -> [String: String] {
         let timestamp = Int(Date().timeIntervalSince1970)
         let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        let message = "\(installationId):\(timestamp):\(nonce)"
-        let sig = hmacSHA256(key: relaySecret, message: message)
+        let bodyHash = SHA256.hash(data: bodyData).map { String(format: "%02x", $0) }.joined()
+        let canonical = "\(method)\n\(path)\n\(timestamp)\n\(nonce)\n\(bodyHash)"
+        let sig = hmacSHA256(key: relaySecret, message: canonical)
         return [
-            "installation_id": installationId,
-            "timestamp":       timestamp,
-            "nonce":           nonce,
-            "hmac":            sig,
+            "X-ChitNow-Installation": installationId,
+            "X-ChitNow-Timestamp":    String(timestamp),
+            "X-ChitNow-Nonce":        nonce,
+            "X-ChitNow-Signature":    sig,
         ]
     }
 
@@ -154,5 +192,36 @@ enum RelayClient {
         let keyData = SymmetricKey(data: Data(key.utf8))
         let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: keyData)
         return mac.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+// MARK: - AnyCodable helper for mixed-type JSON decoding
+
+private struct AnyCodable: Codable {
+    let value: Any
+
+    var stringValue: String? { value as? String }
+    var intValue: Int? { value as? Int }
+
+    init(_ value: Any) { self.value = value }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let s = try? container.decode(String.self)  { value = s; return }
+        if let i = try? container.decode(Int.self)     { value = i; return }
+        if let d = try? container.decode(Double.self)  { value = d; return }
+        if let b = try? container.decode(Bool.self)    { value = b; return }
+        value = NSNull()
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch value {
+        case let s as String:  try container.encode(s)
+        case let i as Int:     try container.encode(i)
+        case let d as Double:  try container.encode(d)
+        case let b as Bool:    try container.encode(b)
+        default:               try container.encodeNil()
+        }
     }
 }

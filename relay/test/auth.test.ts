@@ -7,10 +7,11 @@ import {
   hmacSha256Hex,
   sha256Hex,
   safeEqual,
-  parsePushAuth,
-  verifyPushHmac,
   nowSecs,
   TIMESTAMP_TOLERANCE_SECS,
+  deriveRelaySecret,
+  canonicalMessage,
+  parseAuthHeaders,
 } from "../src/auth";
 
 describe("hmacSha256Hex", () => {
@@ -64,73 +65,134 @@ describe("safeEqual", () => {
   });
 });
 
-describe("parsePushAuth", () => {
-  const valid = {
-    installation_id: "inst-123",
-    timestamp: 1700000000,
-    nonce: "random-nonce-1234",
-    hmac: "a".repeat(64),
-  };
-
-  it("accepts a valid object", () => {
-    expect(parsePushAuth(valid)).toMatchObject({ installation_id: "inst-123" });
+describe("deriveRelaySecret", () => {
+  it("returns a 64-char hex string", async () => {
+    const s = await deriveRelaySecret("master", "inst-123");
+    expect(s).toHaveLength(64);
+    expect(/^[0-9a-f]+$/.test(s)).toBe(true);
   });
 
-  it("rejects null", () => {
-    expect(parsePushAuth(null)).toBeNull();
+  it("same master + installation_id always produces same relay_secret", async () => {
+    const a = await deriveRelaySecret("master-secret", "inst-abc");
+    const b = await deriveRelaySecret("master-secret", "inst-abc");
+    expect(a).toBe(b);
   });
 
-  it("rejects missing hmac", () => {
-    const { hmac, ...rest } = valid;
-    expect(parsePushAuth(rest)).toBeNull();
+  it("different installation_ids derive different relay_secrets", async () => {
+    const a = await deriveRelaySecret("master-secret", "inst-1");
+    const b = await deriveRelaySecret("master-secret", "inst-2");
+    expect(a).not.toBe(b);
   });
 
-  it("rejects nonce too short", () => {
-    expect(parsePushAuth({ ...valid, nonce: "short" })).toBeNull();
-  });
-
-  it("rejects non-numeric timestamp", () => {
-    expect(parsePushAuth({ ...valid, timestamp: "not-a-number" })).toBeNull();
+  it("different master secrets derive different relay_secrets", async () => {
+    const a = await deriveRelaySecret("master-a", "inst-1");
+    const b = await deriveRelaySecret("master-b", "inst-1");
+    expect(a).not.toBe(b);
   });
 });
 
-describe("verifyPushHmac", () => {
-  async function makeClaims(secret: string, overrides: Partial<{
-    installation_id: string; timestamp: number; nonce: string;
-  }> = {}) {
-    const installation_id = overrides.installation_id ?? "inst-abc";
-    const timestamp       = overrides.timestamp ?? nowSecs();
-    const nonce           = overrides.nonce ?? "test-nonce-12345678";
-    const message = `${installation_id}:${timestamp}:${nonce}`;
-    const hmac = await hmacSha256Hex(secret, message);
-    return { installation_id, timestamp, nonce, hmac };
-  }
-
-  it("verifies a correct HMAC", async () => {
-    const claims = await makeClaims("my-secret");
-    expect(await verifyPushHmac(claims, "my-secret")).toBe(true);
+describe("canonicalMessage", () => {
+  it("returns expected format", async () => {
+    const result = await canonicalMessage("POST", "/v1/push", 1700000000, "abc-nonce", "{}");
+    const bodyHash = await sha256Hex("{}");
+    expect(result).toBe(`POST\n/v1/push\n1700000000\nabc-nonce\n${bodyHash}`);
   });
 
-  it("rejects a wrong secret", async () => {
-    const claims = await makeClaims("secret-a");
-    expect(await verifyPushHmac(claims, "secret-b")).toBe(false);
+  it("changes if method changes", async () => {
+    const a = await canonicalMessage("POST", "/v1/push", 1700000000, "nonce", "{}");
+    const b = await canonicalMessage("GET",  "/v1/push", 1700000000, "nonce", "{}");
+    expect(a).not.toBe(b);
   });
 
-  it("rejects a tampered installation_id", async () => {
-    const claims = await makeClaims("secret");
-    const tampered = { ...claims, installation_id: "different-id" };
-    expect(await verifyPushHmac(tampered, "secret")).toBe(false);
+  it("changes if path changes", async () => {
+    const a = await canonicalMessage("POST", "/v1/push",    1700000000, "nonce", "{}");
+    const b = await canonicalMessage("POST", "/v1/revoke",  1700000000, "nonce", "{}");
+    expect(a).not.toBe(b);
   });
 
-  it("rejects a tampered timestamp", async () => {
-    const claims = await makeClaims("secret", { timestamp: 1700000000 });
-    const tampered = { ...claims, timestamp: 1700000001 };
-    expect(await verifyPushHmac(tampered, "secret")).toBe(false);
+  it("changes if timestamp changes", async () => {
+    const a = await canonicalMessage("POST", "/v1/push", 1700000000, "nonce", "{}");
+    const b = await canonicalMessage("POST", "/v1/push", 1700000001, "nonce", "{}");
+    expect(a).not.toBe(b);
   });
 
-  it("rejects a tampered nonce", async () => {
-    const claims = await makeClaims("secret");
-    const tampered = { ...claims, nonce: "different-nonce-xyz" };
-    expect(await verifyPushHmac(tampered, "secret")).toBe(false);
+  it("changes if nonce changes", async () => {
+    const a = await canonicalMessage("POST", "/v1/push", 1700000000, "nonce1", "{}");
+    const b = await canonicalMessage("POST", "/v1/push", 1700000000, "nonce2", "{}");
+    expect(a).not.toBe(b);
+  });
+
+  it("changes if body changes", async () => {
+    const a = await canonicalMessage("POST", "/v1/push", 1700000000, "nonce", "{}");
+    const b = await canonicalMessage("POST", "/v1/push", 1700000000, "nonce", '{"key":"val"}');
+    expect(a).not.toBe(b);
+  });
+});
+
+describe("parseAuthHeaders", () => {
+  const makeReq = (headers: Record<string, string>) =>
+    new Request("https://example.com/v1/push", { method: "POST", headers });
+
+  const validHeaders = {
+    "X-ChitNow-Installation": "inst-abc-123",
+    "X-ChitNow-Timestamp":    "1700000000",
+    "X-ChitNow-Nonce":        "a".repeat(16),
+    "X-ChitNow-Signature":    "a".repeat(64),
+  };
+
+  it("parses valid headers", () => {
+    const result = parseAuthHeaders(makeReq(validHeaders));
+    expect(result).not.toBeNull();
+    expect(result!.installationId).toBe("inst-abc-123");
+    expect(result!.timestamp).toBe(1700000000);
+    expect(result!.nonce).toBe("a".repeat(16));
+    expect(result!.signature).toBe("a".repeat(64));
+  });
+
+  it("returns null if X-ChitNow-Installation missing", () => {
+    const { "X-ChitNow-Installation": _, ...rest } = validHeaders;
+    expect(parseAuthHeaders(makeReq(rest))).toBeNull();
+  });
+
+  it("returns null if X-ChitNow-Timestamp missing", () => {
+    const { "X-ChitNow-Timestamp": _, ...rest } = validHeaders;
+    expect(parseAuthHeaders(makeReq(rest))).toBeNull();
+  });
+
+  it("returns null if X-ChitNow-Nonce missing", () => {
+    const { "X-ChitNow-Nonce": _, ...rest } = validHeaders;
+    expect(parseAuthHeaders(makeReq(rest))).toBeNull();
+  });
+
+  it("returns null if X-ChitNow-Signature missing", () => {
+    const { "X-ChitNow-Signature": _, ...rest } = validHeaders;
+    expect(parseAuthHeaders(makeReq(rest))).toBeNull();
+  });
+
+  it("returns null if timestamp is not an integer string", () => {
+    expect(parseAuthHeaders(makeReq({ ...validHeaders, "X-ChitNow-Timestamp": "not-a-number" }))).toBeNull();
+  });
+
+  it("returns null if nonce is too short", () => {
+    expect(parseAuthHeaders(makeReq({ ...validHeaders, "X-ChitNow-Nonce": "short" }))).toBeNull();
+  });
+
+  it("returns null if signature is not 64 hex chars", () => {
+    expect(parseAuthHeaders(makeReq({ ...validHeaders, "X-ChitNow-Signature": "abc" }))).toBeNull();
+    expect(parseAuthHeaders(makeReq({ ...validHeaders, "X-ChitNow-Signature": "z".repeat(64) }))).toBeNull();
+  });
+});
+
+describe("nowSecs", () => {
+  it("returns a reasonable unix timestamp", () => {
+    const t = nowSecs();
+    expect(t).toBeGreaterThan(1_700_000_000);
+    expect(t).toBeLessThan(2_000_000_000);
+  });
+});
+
+describe("TIMESTAMP_TOLERANCE_SECS", () => {
+  it("is 300 (5 minutes)", () => {
+    expect(TIMESTAMP_TOLERANCE_SECS).toBe(300);
   });
 });

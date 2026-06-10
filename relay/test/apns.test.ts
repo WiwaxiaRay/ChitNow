@@ -18,11 +18,29 @@ const FORBIDDEN_FIELDS = [
 describe("GENERIC_PAYLOAD contract", () => {
   it("has aps.alert with generic title and body", () => {
     expect(GENERIC_PAYLOAD.aps.alert.title).toBe("ChitNow");
-    expect(GENERIC_PAYLOAD.aps.alert.body).toBe("New approval request");
+    expect(GENERIC_PAYLOAD.aps.alert.body).toBe("New approval request — open ChitNow to review");
   });
 
-  it("has aps.category = AGENT_APPROVAL", () => {
-    expect(GENERIC_PAYLOAD.aps.category).toBe("AGENT_APPROVAL");
+  it("does NOT contain category field (non-functional action buttons removed)", () => {
+    const serialised = JSON.stringify(GENERIC_PAYLOAD);
+    expect(serialised).not.toContain('"category"');
+  });
+
+  it("does NOT contain category at any nesting level", () => {
+    function flatten(obj: unknown, keys: string[] = []): string[] {
+      if (typeof obj !== "object" || obj === null) return keys;
+      for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+        keys.push(k);
+        flatten(v, keys);
+      }
+      return keys;
+    }
+    const allKeys = flatten(GENERIC_PAYLOAD);
+    expect(allKeys).not.toContain("category");
+  });
+
+  it("has content-available: 1 for background wake", () => {
+    expect((GENERIC_PAYLOAD.aps as Record<string, unknown>)["content-available"]).toBe(1);
   });
 
   it("has type = approval_request", () => {
