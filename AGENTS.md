@@ -64,10 +64,11 @@ hooks = true
 ```
 High-risk commands (sudo, rm, git push, git reset --hard) are forced into the PermissionRequest flow via `~/.codex/rules/default.rules`. The hook auto-detects the agent by checking whether `transcript_path` contains `.claude`.
 
-Test manually:
+Test manually (read API key from config.json first):
 ```bash
-curl -s -X POST http://localhost:8000/approval-requests \
-  -H "X-API-Key: dev-key" -H "Content-Type: application/json" \
+KEY=$(python3 -c "import json; print(json.load(open('broker/config.json'))['api_key'])")
+curl -sk -X POST https://localhost:8000/approval-requests \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
   -d '{"title":"Test","summary":"test","command":"rm -rf /tmp/x","agent":"claude-code"}'
 ```
 

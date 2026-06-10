@@ -118,14 +118,56 @@ def test_pairing_session_expired(client):
 # Test: pairing page localhost-only
 # ---------------------------------------------------------------------------
 
-def test_pair_page_blocked_from_non_localhost(client):
+def test_pair_page_allowed_from_localhost(client):
     c, _ = client
-    # TestClient sends requests from 127.0.0.1 by default; simulate LAN IP
-    r = c.get("/pair", headers={"X-Forwarded-For": "192.168.1.50"})
-    # The broker checks request.client.host, not X-Forwarded-For.
-    # TestClient uses testclient scope — if it passes, the check needs verifying manually.
-    # At minimum the endpoint must exist and not crash.
-    assert r.status_code in (200, 403)
+    from starlette.testclient import TestClient as _TC
+    from starlette.types import ASGIApp, Receive, Scope, Send
+    import main as broker_main
+
+    class FakeLocalhostMiddleware:
+        def __init__(self, app: ASGIApp):
+            self.app = app
+        async def __call__(self, scope: Scope, receive: Receive, send: Send):
+            if scope["type"] == "http":
+                scope = dict(scope)
+                scope["client"] = ("127.0.0.1", 54321)
+            await self.app(scope, receive, send)
+
+    with _TC(FakeLocalhostMiddleware(broker_main.app)) as tc:
+        r = tc.get("/pair")
+    assert r.status_code == 200
+
+
+def test_pair_page_blocked_from_lan_ip(client):
+    c, _ = client
+    # Inject a LAN client address via the ASGI scope override.
+    # The broker reads request.client.host from the ASGI scope directly.
+    from starlette.testclient import TestClient as _TC
+    import main as broker_main
+
+    class _LanTransport(_TC._real_transport if hasattr(_TC, '_real_transport') else object):
+        pass
+
+    # Simulate LAN IP by patching the transport scope at the ASGI level.
+    # Simplest reliable approach: use app.middleware to inject the scope.
+    from starlette.requests import Request
+    from starlette.responses import Response
+    from starlette.types import ASGIApp, Receive, Scope, Send
+
+    class FakeLanMiddleware:
+        def __init__(self, app: ASGIApp):
+            self.app = app
+        async def __call__(self, scope: Scope, receive: Receive, send: Send):
+            if scope["type"] == "http":
+                scope = dict(scope)
+                scope["client"] = ("192.168.1.50", 12345)
+            await self.app(scope, receive, send)
+
+    from fastapi import FastAPI
+    wrapped = FakeLanMiddleware(broker_main.app)
+    with _TC(wrapped) as tc:
+        r = tc.get("/pair")
+    assert r.status_code == 403
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +202,115 @@ def test_hook_denies_on_missing_config(tmp_path, monkeypatch):
     spec.loader.exec_module(hook)
 
     assert hook.API_KEY is None, "API_KEY must be None when config is missing"
+
+
+# ---------------------------------------------------------------------------
+# Test: /cancel endpoint
+# ---------------------------------------------------------------------------
+
+def _create_pending(c, headers) -> str:
+    r = c.post("/approval-requests", headers=headers, json={
+        "agent": "claude-code", "risk": "high",
+        "title": "test", "summary": "test", "command": "rm -rf /tmp/x", "cwd": "/tmp",
+    })
+    assert r.status_code == 200
+    return r.json()["id"]
+
+
+def test_cancel_pending_request(client):
+    c, _ = client
+    req_id = _create_pending(c, HEADERS)
+    r = c.post(f"/cancel/{req_id}", headers=HEADERS)
+    assert r.status_code == 200
+    # Cancelled request must not appear in pending list
+    pending = c.get("/pending-requests", headers=HEADERS).json()
+    assert not any(p["id"] == req_id for p in pending)
+
+
+def test_cancel_already_cancelled_returns_409(client):
+    c, _ = client
+    req_id = _create_pending(c, HEADERS)
+    c.post(f"/cancel/{req_id}", headers=HEADERS)
+    r = c.post(f"/cancel/{req_id}", headers=HEADERS)
+    assert r.status_code == 409
+
+
+def test_decision_after_cancel_returns_409(client):
+    c, _ = client
+    req_id = _create_pending(c, HEADERS)
+    c.post(f"/cancel/{req_id}", headers=HEADERS)
+    r = c.post(f"/decision/{req_id}", headers=HEADERS, json={"status": "approved"})
+    assert r.status_code == 409
+
+
+def test_cancel_nonexistent_returns_404(client):
+    c, _ = client
+    r = c.post("/cancel/no-such-id", headers=HEADERS)
+    assert r.status_code == 404
+
+
+def test_cancel_approved_request_returns_409(client):
+    c, _ = client
+    req_id = _create_pending(c, HEADERS)
+    c.post(f"/decision/{req_id}", headers=HEADERS, json={"status": "approved"})
+    r = c.post(f"/cancel/{req_id}", headers=HEADERS)
+    assert r.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# Test: APNs not configured — send_push must not raise
+# ---------------------------------------------------------------------------
+
+def test_send_push_no_p8_does_not_raise(client, monkeypatch, tmp_path):
+    """send_push() must be a no-op when .p8 is absent, never raise."""
+    c, broker_main = client
+    monkeypatch.setattr(broker_main, "APNS_KEY_PATH", str(tmp_path / "missing.p8"))
+    import asyncio
+    asyncio.run(broker_main.send_push("fake-token", "title", "body", "req-1"))
+
+
+def test_push_broker_url_no_p8_does_not_raise(client, monkeypatch, tmp_path):
+    """_push_broker_url() must not raise or propagate when .p8 absent."""
+    c, broker_main = client
+    monkeypatch.setattr(broker_main, "APNS_KEY_PATH", str(tmp_path / "missing.p8"))
+    import asyncio
+    asyncio.run(broker_main._push_broker_url("https://192.168.1.1:8000"))
+
+
+def test_create_request_without_apns_succeeds(client, monkeypatch, tmp_path):
+    """POST /approval-requests must succeed even when APNs is not configured."""
+    c, broker_main = client
+    monkeypatch.setattr(broker_main, "APNS_KEY_PATH", str(tmp_path / "missing.p8"))
+    r = c.post("/approval-requests", headers=HEADERS, json={
+        "agent": "claude-code", "risk": "high",
+        "title": "t", "summary": "s", "command": "rm -rf /x", "cwd": "/",
+    })
+    assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Test: QR payload does not contain the long-term API key
+# ---------------------------------------------------------------------------
+
+def test_qr_payload_no_api_key(client):
+    """Pairing session payload must contain 'pt' (token), not 'key' (API key)."""
+    c, broker_main = client
+    # Create a session directly
+    import secrets, time as _t
+    sid = secrets.token_hex(16)
+    pt  = secrets.token_hex(32)
+    broker_main._pairing_sessions[sid] = {
+        "pairing_token": pt,
+        "url": "https://192.168.1.1:8000",
+        "fp":  "aabbcc",
+        "expires_at": _t.time() + 300,
+        "used": False,
+    }
+    # The session dict must not contain the API key
+    session = broker_main._pairing_sessions[sid]
+    assert "key" not in session, "session must not store raw API key"
+    assert GOOD_KEY not in str(session), "API key must not appear in session"
+    assert "pairing_token" in session
 
 
 # ---------------------------------------------------------------------------

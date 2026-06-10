@@ -108,6 +108,14 @@ async def init_db():
 
 
 # ── APNs ──────────────────────────────────────────────────────────────────────
+def apns_configured() -> bool:
+    """Returns True only when the .p8 key file is present on disk."""
+    return bool(
+        APNS_KEY_ID and APNS_TEAM_ID and BUNDLE_ID
+        and os.path.isfile(APNS_KEY_PATH)
+    )
+
+
 async def _apns_auth_token() -> str:
     global _apns_token, _apns_token_at
     now = time.time()
@@ -130,8 +138,8 @@ async def _apns_auth_token() -> str:
 
 
 async def send_push(device_token: str, title: str, body: str, request_id: str):
-    if not APNS_KEY_ID or not APNS_TEAM_ID:
-        print(f"[APNs] not configured — skipping push for {request_id}", flush=True)
+    if not apns_configured():
+        print("[APNs] not configured — skipping alert push", flush=True)
         return
     payload = {
         "aps": {
@@ -144,13 +152,13 @@ async def send_push(device_token: str, title: str, body: str, request_id: str):
         "request_id": request_id,
         "type": "approval_request",
     }
-    headers = {
-        "authorization": f"bearer {await _apns_auth_token()}",
-        "apns-topic": BUNDLE_ID,
-        "apns-push-type": "alert",
-        "apns-priority": "10",
-    }
     try:
+        headers = {
+            "authorization": f"bearer {await _apns_auth_token()}",
+            "apns-topic": BUNDLE_ID,
+            "apns-push-type": "alert",
+            "apns-priority": "10",
+        }
         async with httpx.AsyncClient(http2=True) as client:
             resp = await client.post(
                 f"{APNS_HOST}/3/device/{device_token}",
@@ -161,9 +169,11 @@ async def send_push(device_token: str, title: str, body: str, request_id: str):
         if resp.status_code == 200:
             print(f"[APNs] push sent: {request_id}", flush=True)
         else:
-            print(f"[APNs] error {resp.status_code}: {resp.text}", flush=True)
+            # Log only status + reason — never log JWT, device token, or full response
+            reason = resp.json().get("reason", "unknown") if resp.content else "empty"
+            print(f"[APNs] error {resp.status_code}: {reason}", flush=True)
     except Exception as e:
-        print(f"[APNs] exception sending push for {request_id}: {e}", flush=True)
+        print(f"[APNs] push failed: {type(e).__name__}", flush=True)
 
 
 # ── app ───────────────────────────────────────────────────────────────────────
@@ -188,35 +198,39 @@ def _current_ip() -> str | None:
 
 
 async def _push_broker_url(broker_url: str, label: str = "push") -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT device_token FROM devices WHERE id='default'")
-        row = await cur.fetchone()
-    if not row:
-        print(f"[{label}] no device registered", flush=True)
+    if not apns_configured():
+        print(f"[{label}] APNs not configured — skipping silent push", flush=True)
         return
-    payload = {
-        "aps": {"content-available": 1},
-        "type": "broker_started",
-        "broker_url": broker_url,
-    }
-    headers = {
-        "authorization": f"bearer {await _apns_auth_token()}",
-        "apns-topic": BUNDLE_ID,
-        "apns-push-type": "background",
-        "apns-priority": "5",
-    }
     try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT device_token FROM devices WHERE id='default'")
+            row = await cur.fetchone()
+        if not row:
+            print(f"[{label}] no device registered", flush=True)
+            return
+        payload = {
+            "aps": {"content-available": 1},
+            "type": "broker_started",
+            "broker_url": broker_url,
+        }
+        headers = {
+            "authorization": f"bearer {await _apns_auth_token()}",
+            "apns-topic": BUNDLE_ID,
+            "apns-push-type": "background",
+            "apns-priority": "5",
+        }
         async with httpx.AsyncClient(http2=True) as client:
             resp = await client.post(
                 f"{APNS_HOST}/3/device/{row[0]}",
                 json=payload, headers=headers, timeout=10,
             )
         if resp.status_code == 200:
-            print(f"[{label}] broker URL sent: {broker_url}", flush=True)
+            print(f"[{label}] silent push sent", flush=True)
         else:
-            print(f"[{label}] APNs error {resp.status_code}: {resp.text}", flush=True)
+            reason = resp.json().get("reason", "unknown") if resp.content else "empty"
+            print(f"[{label}] APNs error {resp.status_code}: {reason}", flush=True)
     except Exception as e:
-        print(f"[{label}] failed: {e}", flush=True)
+        print(f"[{label}] failed: {type(e).__name__}", flush=True)
 
 
 async def _startup_push():
@@ -321,7 +335,7 @@ async def create_request(body: RequestBody, x_api_key: str = Header("")):
             send_push(row[0], body.title, body.summary, req_id)
         )
 
-    print(f"[broker] created {req_id}: {body.summary}")
+    print(f"[broker] created {req_id}: {body.summary[:40]}")
     return {"id": req_id, "expires_at": expires_at.isoformat()}
 
 
@@ -362,6 +376,41 @@ async def wait_decision(request_id: str, x_api_key: str = Header("")):
         yield f"data: {json.dumps({'status': status})}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.post("/cancel/{request_id}")
+async def cancel_request(request_id: str, x_api_key: str = Header("")):
+    """Cancel a pending request (e.g. Codex PermissionRequest 15s fallback).
+
+    Returns 404 if not found, 409 if already decided/cancelled/expired.
+    On success the SSE waiter is woken so the hook unblocks immediately.
+    """
+    auth(x_api_key)
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE approval_requests SET status='cancelled', decided_at=? "
+            "WHERE id=? AND status='pending'",
+            (now, request_id),
+        )
+        if cur.rowcount == 0:
+            row = await (await db.execute(
+                "SELECT status FROM approval_requests WHERE id=?", (request_id,)
+            )).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Request not found")
+            raise HTTPException(status_code=409, detail=f"Already {row[0]}")
+        await db.execute(
+            "INSERT INTO audit_log (request_id, action) VALUES (?, ?)",
+            (request_id, "cancelled"),
+        )
+        await db.commit()
+
+    print(f"[broker] cancelled {request_id}", flush=True)
+    event = _waiters.pop(request_id, None)
+    if event:
+        event.set()
+    return {"status": "ok"}
 
 
 @app.post("/decision/{request_id}")

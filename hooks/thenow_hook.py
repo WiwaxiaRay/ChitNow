@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Claude Code PreToolUse hook for thenow approval broker.
-Exit 0 = allow, exit 1 = deny.
+Exit codes: 0 = allow, 2 = deny (blocks execution), 1 = hook error (non-blocking).
 
 Set env vars (optional overrides):
   THENOW_BROKER_URL     broker HTTPS URL
@@ -171,6 +171,19 @@ _agent: str = ""            # set by _parse_input
 _description: str = ""      # set by _parse_input (Codex PermissionRequest description)
 
 
+def _cancel_request(req_id: str, headers: dict, verify) -> None:
+    """Best-effort cancel — never raises, never blocks the fallback path."""
+    try:
+        httpx.post(
+            f"{BROKER_URL}/cancel/{req_id}",
+            headers=headers,
+            timeout=3,
+            verify=verify,
+        )
+    except Exception:
+        pass
+
+
 def _exit_passthrough() -> None:
     """Not high-risk — let Codex handle with its normal approval UI."""
     sys.exit(0)
@@ -283,7 +296,9 @@ def main():
                     _exit_deny(status)
     except httpx.TimeoutException:
         if _hook_event_name == "PermissionRequest":
-            print("[thenow] Watch timeout (10s) — falling back to Codex UI", file=sys.stderr)
+            print("[thenow] Watch timeout — cancelling request, falling back to Codex UI",
+                  file=sys.stderr)
+            _cancel_request(req_id, headers, verify)
             _exit_passthrough()
         print("[thenow] SSE timeout — denying", file=sys.stderr)
         _exit_deny("timeout")

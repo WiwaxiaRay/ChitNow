@@ -53,7 +53,11 @@ echo "    Hook installed at $HOOKS_DIR/thenow_hook.py"
 # ── 5. Claude Code settings.json ──────────────────────────────────────────────
 echo "==> Wiring Claude Code PreToolUse hook..."
 CONFIG_PATH="$REPO/broker/config.json"
-HOOK_CMD="env THENOW_CONFIG_PATH=$CONFIG_PATH $REPO/broker/.venv/bin/python $HOOKS_DIR/thenow_hook.py"
+# Use printf %q so paths containing spaces are safely shell-quoted.
+printf -v HOOK_CMD 'env THENOW_CONFIG_PATH=%q %q %q' \
+    "$CONFIG_PATH" \
+    "$REPO/broker/.venv/bin/python" \
+    "$HOOKS_DIR/thenow_hook.py"
 
 if [ ! -f "$SETTINGS" ]; then
     mkdir -p "$(dirname "$SETTINGS")"
@@ -93,7 +97,10 @@ print("    settings.json updated.")
 PYEOF
 
 # ── 6. Done ────────────────────────────────────────────────────────────────────
-CODEX_HOOK_CMD="env THENOW_CONFIG_PATH=$CONFIG_PATH $REPO/broker/.venv/bin/python $HOOKS_DIR/thenow_hook.py"
+printf -v CODEX_HOOK_CMD 'env THENOW_CONFIG_PATH=%q %q %q' \
+    "$CONFIG_PATH" \
+    "$REPO/broker/.venv/bin/python" \
+    "$HOOKS_DIR/thenow_hook.py"
 
 echo ""
 echo "==> Installation complete!"
@@ -119,5 +126,10 @@ echo ""
 echo "[features]"
 echo "hooks = true"
 echo ""
+echo "─────────────────────────────────────────────────────────────"
+echo "  Codex high-risk rules (optional but recommended):"
+echo "  Merge $REPO/codex/default.rules.example"
+echo "  into ~/.codex/rules/default.rules, then run /hooks"
+echo "  in the Codex TUI to re-trust."
 echo "─────────────────────────────────────────────────────────────"
 echo "To uninstall: bash uninstall.sh"

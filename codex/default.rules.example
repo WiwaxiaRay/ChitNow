@@ -1,0 +1,34 @@
+# ChitNow — Codex PermissionRequest rule template
+#
+# These rules route matching shell commands into Codex's PermissionRequest
+# flow, where ChitNow intercepts them and sends an approval request to your
+# Apple Watch.
+#
+# INSTALL:
+#   Merge into ~/.codex/rules/default.rules (create if it doesn't exist).
+#   Then re-trust hooks in the Codex TUI: run /hooks and confirm.
+#
+# NOTE: ChitNow only receives commands that Codex routes here. Commands not
+# matched by these rules are executed directly without Watch approval.
+
+# Privilege escalation
+sudo
+
+# Destructive file operations
+rm -rf
+rm -r
+
+# Force-push and history rewrite
+git push --force
+git push -f
+git reset --hard
+git clean -fd
+git clean -f
+
+# Remote script execution via pipe
+curl.*\|\s*(ba)?sh
+wget.*\|\s*(ba)?sh
+
+# Overwrite system paths
+>\ */etc/
+>\ */usr/

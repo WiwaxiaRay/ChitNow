@@ -12,6 +12,13 @@ broker/thenow.db
 *.p8
 AuthKey_*
 
+# Relay credentials (Phase 3) — NEVER commit
+relay_credentials.json
+broker/relay_credentials.json
+
+# Secret rotation logs
+scripts/*.log
+
 # Xcode
 *.xcuserdata/
 *.xcworkspace/xcuserdata/

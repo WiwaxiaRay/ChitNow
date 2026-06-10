@@ -13,7 +13,9 @@ When Claude Code or Codex wants to run a high-risk command (`rm -rf`, `git push 
 - Same Wi-Fi network as your Mac (LAN-only — no cloud relay)
 - **Optional:** [codexbar](https://github.com/steipete/codexbar) for token/cost display on Watch
 
-> **Note:** When the Watch app is open, ChitNow checks for approval requests approximately every 5 seconds. Reliable background alerts require APNs — see [APNs Setup](#apns-setup) to configure your own Apple Developer account.
+> **Note:** Without APNs, the iPhone and Watch apps check for requests approximately every 5 seconds while active. Reliable background alerts require APNs — see [APNs Setup](#apns-setup) to configure your own Apple Developer account.
+>
+> **Codex:** ChitNow only receives Codex commands that Codex routes into PermissionRequest. Install or merge `codex/default.rules.example` to cover the recommended high-risk commands. After a 15-second timeout with no Watch response, ChitNow cancels the request and falls back to Codex's native approval UI.
 
 ## Install
 
@@ -67,7 +69,9 @@ bash uninstall.sh
 
 ## APNs Setup
 
-Without APNs, approvals arrive within 5 seconds via polling — fully functional, just not instant.
+Without APNs, the iPhone and Watch apps check for requests approximately every 5 seconds while active — fully functional, just not instant. Mac IP changes may require re-pairing when APNs is not configured.
+
+When APNs is enabled, the request title, summary, request ID, and broker address pass through Apple's APNs servers. The full command and approval decision remain local.
 
 For instant vibration push notifications, you need an Apple Developer account:
 
