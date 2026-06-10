@@ -69,7 +69,7 @@ statusMessage = "Waiting for Apple Watch approval..."
 [features]
 hooks = true
 ```
-High-risk commands (sudo, rm, git push, git reset --hard) are forced into the PermissionRequest flow via `~/.codex/rules/default.rules`. The hook auto-detects the agent by checking whether `transcript_path` contains `.claude`.
+Commands matching `~/.codex/rules/default.rules` (sudo, rm, git push, git reset --hard, etc.) are routed into the PermissionRequest flow by Codex. The hook then sends all PermissionRequest commands to Watch without additional regex filtering. The hook auto-detects the agent by checking whether `transcript_path` contains `.claude`.
 
 The hook reads `broker/config.json` for the API key and uses `broker/certs/broker.crt` as the TLS verification cert (`verify=CERT_PATH` in httpx).
 
@@ -89,31 +89,72 @@ The broker uses **HTTPS + self-signed cert + cert pinning**. The pairing flow di
 
 ```
 User opens https://localhost:8000/pair in browser
-  → broker generates one-time session {sid, key, url, fp, exp}
-  → QR code encodes the JSON payload
+  → broker generates one-time session:
+      sid           = random hex 16 bytes
+      pairing_token = random hex 32 bytes  (5 min TTL, single-use)
+      QR payload v2 = {v:2, sid, pt, url, fp, exp}
+                                  ↑
+                            pairing token — API key is NOT in the QR
 iPhone scans QR → PairingView.swift
-  → POST /pair/{sid}/confirm (using PinnedSessionDelegate with scanned fp)
+  → POST /pair/{sid}/confirm  header: X-Pairing-Token: <pt>
+      (TLS pinned using scanned fp)
+  → response: {api_key, broker_url, cert_fp}  ← API key returned here
   → stores {brokerURL, apiKey, certFingerprint} in iOS Keychain
   → calls discoverAndShareWithWatch() → WCSession.updateApplicationContext
 Watch receives context → stores in App Group UserDefaults (group.com.wangyang.thenow)
 Widget reads from same App Group UserDefaults
 ```
 
-All clients (iOS, Watch, Widget, hook) pin to the cert fingerprint. On fingerprint mismatch, `PinnedSessionDelegate` posts `Notification.Name.certMismatch` → iOS shows re-pair alert.
+TLS pinning model:
+- Hook (httpx): `verify=broker.crt` — uses cert file as trust root, not fingerprint comparison
+- iPhone/Watch/Widget: SHA-256 fingerprint comparison in `PinnedSessionDelegate` / `WatchPinnedDelegate`
+- On fingerprint mismatch, `PinnedSessionDelegate` posts `Notification.Name.certMismatch` → iOS shows re-pair alert
+
+API Key storage locations: Mac `broker/config.json` (600), iPhone Keychain, Watch/Widget App Group UserDefaults (not Keychain-level protection)
+
+Cert SAN includes localhost + LAN IPs detected via hostname resolution at generation time (not a full network interface enumeration).
 
 ### Request flow
 
 ```
-Claude Code / Codex
-  → thenow_hook.py (PreToolUse / PermissionRequest)
-    → POST /approval-requests          # creates DB record, sends APNs push
-    → GET  /wait/{id} (SSE)            # blocks until decision or timeout
-        PermissionRequest: 15s timeout → falls back to Codex native UI
-        PreToolUse:       180s timeout → denies on expiry
-iPhone receives push → user long-presses → APPROVE/DENY
-  → NotificationDelegate.swift → POST /decision/{id}
-Apple Watch polls GET /pending-requests every 5s
-  → PendingRequestCard → POST /decision/{id}
+Hook intercept:
+  PreToolUse (Claude Code / Codex):
+      is_high_risk() regex match → only matching commands sent to Watch
+      exit codes: Claude deny=1, Codex deny=2, allow=0
+  PermissionRequest (Codex):
+      ALL commands entering PermissionRequest are sent to Watch — no regex filter
+      exit codes: approve/deny → stdout JSON {behavior:...} + exit 0
+                  timeout (15s) → no JSON + exit 0 (falls back to Codex native UI)
+
+  → POST /approval-requests   (TLS: verify=broker.crt as trust root)
+  → GET  /wait/{id} (SSE)     blocks until decision or timeout (~185s PreToolUse, 15s PermissionRequest)
+
+Discovery and notification paths run in parallel (APNs is additive, not exclusive):
+
+  APNs path (when .p8 configured):
+      broker → Apple APNs (title, summary, request_id — passes through Apple servers)
+      → iPhone AppDelegate.didReceiveRemoteNotification
+        → PhoneSessionManager.pingWatchNewRequest()
+          → WCSession.sendMessage (immediate if Watch app in foreground)
+          → WCSession.transferUserInfo (queued for next Watch app activation)
+
+  iPhone foreground polling (always active when app is foregrounded):
+      every 5s GET /pending-requests → new IDs → pingWatchNewRequest()
+
+  Watch direct polling (always active when Watch app is open):
+      every 5s GET /pending-requests → PendingRequestCard
+
+Decision paths:
+  iPhone notification: user long-presses → APPROVE/DENY
+    → NotificationDelegate.swift → BrokerClient.postDecision → POST /decision/{id}
+  Apple Watch: PendingRequestCard → POST /decision/{id}
+  Both send: {"status": "approved" | "denied"}
+
+IP change recovery:
+  With APNs: broker silent push → iPhone updates Keychain + pushes new URL to Watch
+  Without APNs: Watch fetchPending() failure → requestFreshBrokerURL()
+    → WCSession sendMessage → iPhone queries /broker-ip (using current Keychain URL)
+    → if Mac IP changed and no APNs, iPhone Keychain URL is also stale → re-pair needed
 ```
 
 ### Broker (`broker/main.py`)
@@ -134,10 +175,10 @@ Apple Watch polls GET /pending-requests every 5s
 ### iOS app (`thenow/`)
 
 - `KeychainHelper.swift` — stores/reads `brokerURL`, `apiKey`, `certFingerprint` from iOS Keychain (`kSecClassGenericPassword`)
-- `PairingView.swift` — QR scanner (`AVCaptureSession`), parses `PairingPayload`, calls `POST /pair/{sid}/confirm`, saves to Keychain on success
+- `PairingView.swift` — QR scanner (`AVCaptureSession`), parses `PairingPayload` (v2: contains pairing token `pt`, not API key), calls `POST /pair/{sid}/confirm` with `X-Pairing-Token` header, receives `api_key` from response, saves to Keychain
 - `BrokerClient.swift` — `PinnedSessionDelegate` pins TLS against stored fingerprint; posts `.certMismatch` notification on mismatch; `discoverAndShareWithWatch()` pushes all three credentials to Watch via `WCSession.updateApplicationContext`
 - `ContentView.swift` — switches between `PairingView` / `ActiveView`; shows cert-mismatch alert; `DiagnosticsView` sheet with live health check
-- `thenowApp.swift` — `AppDelegate` registers for APNs; `pingWatchNewRequest()` calls both `sendMessage` (foreground) and `transferUserInfo` (background-queued) for reliable Watch delivery
+- `thenowApp.swift` — `AppDelegate` registers for APNs; `PhoneSessionManager.startPolling()` runs every 5s while app is foregrounded, diffs pending request IDs, calls `pingWatchNewRequest()` on new IDs; silent push handler updates iPhone Keychain before pushing new broker URL to Watch
 
 ### Watch App (`thenow Watch App/`)
 
@@ -176,7 +217,7 @@ Apple Watch polls GET /pending-requests every 5s
 - **APNs env**: launchd plist sets `THENOW_APNS_ENV=production`. Xcode direct-install (development profile) gets sandbox tokens — switch to `sandbox` or the push will fail with BadDeviceToken.
 - **Cert regeneration**: running `generate_config.py` or deleting `broker/certs/` creates a new cert with a new fingerprint. All paired clients will get `.certMismatch` and must re-pair by scanning the QR again.
 - **App Group entitlements**: Watch App and Widget both require `group.com.wangyang.thenow` in their `.entitlements` files and matching provisioning profiles. Missing entitlement = Widget shows stale/empty data.
-- **Watch broker URL**: Watch reads from App Group `UserDefaults["brokerURL"]`. Fallback IP in `WatchBrokerClient.swift` is last-resort — recovers within ~60s via IP monitor push.
+- **Watch broker URL**: Watch reads from App Group `UserDefaults["brokerURL"]`. On network failure, Watch asks iPhone for a fresh URL via WCSession. With APNs, IP changes are pushed automatically (~60s). Without APNs, if Mac IP changes, both Watch and iPhone hold the stale URL — re-pair is usually required.
 - **mDNS on watchOS**: `.local` hostnames don't resolve in watchOS `URLSession` — Watch and Widget always use direct IP.
 - **Codex hook trust**: After editing `~/.codex/config.toml`, re-trust via `codex` CLI TUI (`/hooks`); desktop app panel is read-only.
 - **Quota data stale**: codexbar must be running on Mac to refresh the JSON files the broker reads.
