@@ -288,6 +288,91 @@ def test_relay_credentials_endpoint_without_relay_url(client):
 
 
 # ---------------------------------------------------------------------------
+# Test: pair_confirm ignores relay_url from body (security fix)
+# ---------------------------------------------------------------------------
+
+def test_pair_confirm_ignores_relay_url_from_body(client, monkeypatch, tmp_path):
+    """pair_confirm must NOT use relay_url from the request body."""
+    c, broker_main = client
+    import secrets, time as _time
+
+    # Ensure broker has no RELAY_URL configured
+    monkeypatch.setattr(broker_main, "RELAY_URL", "")
+
+    saved_calls = []
+    def _mock_save(relay_url, installation_id, relay_secret):
+        saved_calls.append(relay_url)
+    monkeypatch.setattr(broker_main.relay_client, "save_credentials", _mock_save)
+
+    sid = secrets.token_hex(8)
+    pt = secrets.token_hex(32)
+    broker_main._pairing_sessions[sid] = {
+        "pairing_token": pt,
+        "url": "https://192.168.1.1:8000",
+        "fp":  "aabbcc",
+        "expires_at": _time.time() + 300,
+        "used": False,
+    }
+    r = c.post(f"/pair/{sid}/confirm",
+               headers={"X-Pairing-Token": pt},
+               json={"installation_id": "inst-123",
+                     "relay_secret": "secret-abc"})
+    assert r.status_code == 200
+    # save_credentials must NOT have been called (RELAY_URL is empty)
+    assert len(saved_calls) == 0, "save_credentials must not be called when RELAY_URL is empty"
+
+
+def test_relay_credentials_saved_from_config_relay_url(client, monkeypatch, tmp_path):
+    """pair_confirm uses broker's own RELAY_URL from config, not the body."""
+    c, broker_main = client
+    import secrets, time as _time
+
+    # Set broker's RELAY_URL to a known value
+    monkeypatch.setattr(broker_main, "RELAY_URL", "https://relay.example.com")
+
+    saved_calls = []
+    def _mock_save(relay_url, installation_id, relay_secret):
+        saved_calls.append({"relay_url": relay_url, "id": installation_id})
+    monkeypatch.setattr(broker_main.relay_client, "save_credentials", _mock_save)
+
+    sid = secrets.token_hex(8)
+    pt = secrets.token_hex(32)
+    broker_main._pairing_sessions[sid] = {
+        "pairing_token": pt,
+        "url": "https://192.168.1.1:8000",
+        "fp":  "aabbcc",
+        "expires_at": _time.time() + 300,
+        "used": False,
+    }
+    r = c.post(f"/pair/{sid}/confirm",
+               headers={"X-Pairing-Token": pt},
+               json={"installation_id": "inst-from-body",
+                     "relay_secret": "secret-from-body"})
+    assert r.status_code == 200
+    assert len(saved_calls) == 1
+    # URL must come from broker config, not body
+    assert saved_calls[0]["relay_url"] == "https://relay.example.com"
+    assert saved_calls[0]["id"] == "inst-from-body"
+
+
+def test_relay_credentials_endpoint_with_relay_url_configured(client, monkeypatch, tmp_path):
+    """POST /relay-credentials succeeds when broker's RELAY_URL is configured."""
+    c, broker_main = client
+    monkeypatch.setattr(broker_main, "RELAY_URL", "https://relay.example.com")
+
+    saved = []
+    monkeypatch.setattr(broker_main.relay_client, "save_credentials",
+                        lambda url, iid, sec: saved.append(url))
+
+    r = c.post("/relay-credentials", headers=HEADERS, json={
+        "installation_id": "inst-test",
+        "relay_secret": "sec-test",
+    })
+    assert r.status_code == 200
+    assert saved == ["https://relay.example.com"]
+
+
+# ---------------------------------------------------------------------------
 # Test: QR payload does not contain the long-term API key
 # ---------------------------------------------------------------------------
 

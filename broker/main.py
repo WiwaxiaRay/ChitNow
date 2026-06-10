@@ -166,7 +166,6 @@ class DecisionBody(BaseModel):
     status: str  # "approved" | "denied"
 
 class PairConfirmBody(BaseModel):
-    relay_url: str = ""
     installation_id: str = ""
     relay_secret: str = ""
 
@@ -208,7 +207,7 @@ async def create_request(body: RequestBody, x_api_key: str = Header("")):
     _waiters[req_id] = asyncio.Event()
     asyncio.create_task(relay_client.push_notification())
 
-    print(f"[broker] created {req_id}: {body.summary[:40]}")
+    print(f"[broker] created {req_id} agent={body.agent}", flush=True)
     return {"id": req_id, "expires_at": expires_at.isoformat()}
 
 
@@ -733,8 +732,9 @@ async def pair_confirm(sid: str, body: PairConfirmBody = PairConfirmBody(),
     if x_pairing_token != session["pairing_token"]:
         raise HTTPException(status_code=401, detail="Invalid pairing token")
     session["used"] = True
-    if body.relay_url and body.installation_id and body.relay_secret:
-        relay_client.save_credentials(body.relay_url, body.installation_id, body.relay_secret)
+    # Use broker's own RELAY_URL from local config — never trust relay_url from external input.
+    if RELAY_URL and body.installation_id and body.relay_secret:
+        relay_client.save_credentials(RELAY_URL, body.installation_id, body.relay_secret)
     print(f"[pair] iPhone confirmed pairing session {sid}", flush=True)
     return {
         "status":     "ok",
