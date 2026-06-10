@@ -115,7 +115,9 @@ class TestLogSanitisation:
     """Ensure broker logs don't emit full device tokens or raw commands."""
 
     def _make_client(self, monkeypatch, tmp_path):
+        import asyncio
         key = "test-log-sanitise-key"
+        db_path = str(tmp_path / "test_log.db")
         monkeypatch.setenv("THENOW_API_KEY", key)
         monkeypatch.setenv("THENOW_APNS_ENV", "sandbox")
         import sys as _sys
@@ -123,6 +125,9 @@ class TestLogSanitisation:
             if mod == "main":
                 del _sys.modules[mod]
         import main as m
+        monkeypatch.setattr(m, "DB_PATH", db_path)
+        # Manually initialise DB tables — lifespan is not triggered without 'with TestClient'
+        asyncio.run(m.init_db())
         from fastapi.testclient import TestClient
         return TestClient(m.app), m, key
 

@@ -36,6 +36,7 @@ echo "    Done."
 
 # ── 3. launchd plist ───────────────────────────────────────────────────────────
 echo "==> Installing launchd plist..."
+mkdir -p "$(dirname "$PLIST_DST")"   # ~/Library/LaunchAgents may not exist on fresh macOS
 if launchctl list "$PLIST_LABEL" &>/dev/null; then
     launchctl unload "$PLIST_DST" 2>/dev/null || true
 fi
@@ -62,6 +63,13 @@ printf -v HOOK_CMD 'env THENOW_CONFIG_PATH=%q %q %q' \
 if [ ! -f "$SETTINGS" ]; then
     mkdir -p "$(dirname "$SETTINGS")"
     echo '{}' > "$SETTINGS"
+fi
+
+# Validate existing settings.json is valid JSON before touching it
+if ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$SETTINGS" 2>/dev/null; then
+    echo "ERROR: $SETTINGS is not valid JSON. Aborting hook wiring."
+    echo "       Fix or delete the file and re-run install.sh."
+    exit 1
 fi
 
 # Backup settings.json before modification
@@ -91,8 +99,11 @@ elif isinstance(hooks, list):
             break
     else:
         hooks.append(entry)
+# Verify the result is valid JSON before writing
+out = json.dumps(cfg, indent=2)
+json.loads(out)   # parse check
 with open(path, "w") as f:
-    json.dump(cfg, f, indent=2)
+    f.write(out)
 print("    settings.json updated.")
 PYEOF
 

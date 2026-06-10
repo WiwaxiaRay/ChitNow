@@ -433,7 +433,7 @@ struct PendingRequestCard: View {
         self.request  = request
         self.theme    = theme
         self.onDecide = onDecide
-        _countdown    = StateObject(wrappedValue: CardCountdown(initial: max(0, request.remainingSeconds - 165)))
+        _countdown    = StateObject(wrappedValue: CardCountdown(initial: max(0, request.remainingSeconds)))
     }
 
     var body: some View {

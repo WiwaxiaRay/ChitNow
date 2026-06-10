@@ -390,15 +390,17 @@ async def cancel_request(request_id: str, x_api_key: str = Header("")):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "UPDATE approval_requests SET status='cancelled', decided_at=? "
-            "WHERE id=? AND status='pending'",
+            "WHERE id=? AND status='pending' AND datetime(expires_at) > datetime('now')",
             (now, request_id),
         )
         if cur.rowcount == 0:
             row = await (await db.execute(
-                "SELECT status FROM approval_requests WHERE id=?", (request_id,)
+                "SELECT status, expires_at FROM approval_requests WHERE id=?", (request_id,)
             )).fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Request not found")
+            if row[0] == "pending":
+                raise HTTPException(status_code=410, detail="Request expired")
             raise HTTPException(status_code=409, detail=f"Already {row[0]}")
         await db.execute(
             "INSERT INTO audit_log (request_id, action) VALUES (?, ?)",

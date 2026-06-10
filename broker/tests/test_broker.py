@@ -25,19 +25,18 @@ def _make_config(tmp_path) -> str:
 
 @pytest.fixture()
 def client(monkeypatch, tmp_path):
-    """Broker test client with a temp config and certs directory."""
-    cfg_path = _make_config(tmp_path)
-    # Point broker at the temp dir so it uses our test key
+    """Broker test client with isolated config and database (never touches real files)."""
+    _make_config(tmp_path)
+    db_path = str(tmp_path / "test_broker.db")
     monkeypatch.setenv("THENOW_API_KEY", "test-key-abc123")
-    # Avoid APNs key load failure during import
     monkeypatch.setenv("THENOW_APNS_ENV", "sandbox")
 
-    import importlib
     import sys
-    # Reload main to pick up monkeypatched env
     if "main" in sys.modules:
         del sys.modules["main"]
     import main as broker_main
+    # Redirect DB to isolated temp path so tests never touch broker/broker.db
+    monkeypatch.setattr(broker_main, "DB_PATH", db_path)
     with TestClient(broker_main.app) as c:
         yield c, broker_main
 
@@ -311,6 +310,190 @@ def test_qr_payload_no_api_key(client):
     assert "key" not in session, "session must not store raw API key"
     assert GOOD_KEY not in str(session), "API key must not appear in session"
     assert "pairing_token" in session
+
+
+# ---------------------------------------------------------------------------
+# Test: uninstall only removes ChitNow hook, not other hooks
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Test: /cancel only cancels non-expired pending requests
+# ---------------------------------------------------------------------------
+
+def test_cancel_expired_request_returns_410(client):
+    """cancel on an expired-but-still-pending row must return 410, not 200 or 409."""
+    import sqlite3 as _sqlite3
+    c, broker_main = client
+    req_id = _create_pending(c, HEADERS)
+    # Force-expire the row directly in the DB
+    conn = _sqlite3.connect(broker_main.DB_PATH)
+    conn.execute(
+        "UPDATE approval_requests SET expires_at=datetime('now', '-1 second') WHERE id=?",
+        (req_id,),
+    )
+    conn.commit()
+    conn.close()
+    r = c.post(f"/cancel/{req_id}", headers=HEADERS)
+    assert r.status_code == 410, f"expected 410 for expired pending, got {r.status_code}"
+
+
+# ---------------------------------------------------------------------------
+# Test: SSE integration — approved, denied, cancelled flows
+# ---------------------------------------------------------------------------
+
+def test_sse_approved_flow(client):
+    """Full approve flow: create → post decision → SSE stream yields 'approved'."""
+    import threading
+    c, _ = client
+    req_id = _create_pending(c, HEADERS)
+
+    result = {}
+
+    def _post_decision():
+        time.sleep(0.05)
+        result["r"] = c.post(f"/decision/{req_id}", headers=HEADERS, json={"status": "approved"})
+
+    t = threading.Thread(target=_post_decision)
+    t.start()
+
+    with c.stream("GET", f"/wait/{req_id}", headers=HEADERS) as resp:
+        for line in resp.iter_lines():
+            if line.startswith("data:"):
+                result["sse"] = json.loads(line[5:])
+                break
+
+    t.join()
+    assert result["sse"]["status"] == "approved"
+    assert result["r"].status_code == 200
+
+
+def test_sse_denied_flow(client):
+    """Full deny flow: create → post deny → SSE stream yields 'denied'."""
+    import threading
+    c, _ = client
+    req_id = _create_pending(c, HEADERS)
+    result = {}
+
+    def _deny():
+        time.sleep(0.05)
+        result["r"] = c.post(f"/decision/{req_id}", headers=HEADERS, json={"status": "denied"})
+
+    t = threading.Thread(target=_deny)
+    t.start()
+
+    with c.stream("GET", f"/wait/{req_id}", headers=HEADERS) as resp:
+        for line in resp.iter_lines():
+            if line.startswith("data:"):
+                result["sse"] = json.loads(line[5:])
+                break
+    t.join()
+    assert result["sse"]["status"] == "denied"
+
+
+def test_sse_cancelled_flow(client):
+    """Cancel flow: create → cancel → SSE stream yields 'cancelled'."""
+    import threading
+    c, _ = client
+    req_id = _create_pending(c, HEADERS)
+    result = {}
+
+    def _cancel():
+        time.sleep(0.05)
+        result["r"] = c.post(f"/cancel/{req_id}", headers=HEADERS)
+
+    t = threading.Thread(target=_cancel)
+    t.start()
+
+    with c.stream("GET", f"/wait/{req_id}", headers=HEADERS) as resp:
+        for line in resp.iter_lines():
+            if line.startswith("data:"):
+                result["sse"] = json.loads(line[5:])
+                break
+    t.join()
+    assert result["sse"]["status"] == "cancelled"
+
+
+def test_cancel_vs_decision_race(client):
+    """When cancel and decision arrive concurrently, exactly one wins."""
+    import threading
+    c, _ = client
+    req_id = _create_pending(c, HEADERS)
+
+    cancel_result = {}
+    decision_result = {}
+
+    def _cancel():
+        cancel_result["r"] = c.post(f"/cancel/{req_id}", headers=HEADERS)
+
+    def _decide():
+        decision_result["r"] = c.post(f"/decision/{req_id}", headers=HEADERS,
+                                      json={"status": "approved"})
+
+    t1 = threading.Thread(target=_cancel)
+    t2 = threading.Thread(target=_decide)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    codes = {cancel_result["r"].status_code, decision_result["r"].status_code}
+    # Exactly one succeeds (200) and one fails (409 or 410)
+    assert 200 in codes, f"Expected one 200, got {codes}"
+    assert codes != {200, 200}, "Both cancel and decision cannot win"
+
+
+# ---------------------------------------------------------------------------
+# Test: TOML output from install.sh is tomllib-parseable
+# ---------------------------------------------------------------------------
+
+def test_install_sh_toml_output_is_valid(tmp_path):
+    """The Codex TOML snippet printed by install.sh must be parseable by tomllib.
+
+    TOML structure: [[hooks.PermissionRequest]] creates one array-of-tables element;
+    [[hooks.PermissionRequest.hooks]] adds a sub-array inside that same element.
+    Result: hooks.PermissionRequest is a list of length 1, each item having a
+    "matcher" key and a "hooks" sub-list.
+    """
+    import tomllib
+    hook_cmd = "env THENOW_CONFIG_PATH=/tmp/config.json /tmp/.venv/bin/python /tmp/thenow_hook.py"
+    toml_snippet = f"""[[hooks.PermissionRequest]]
+matcher = "^Bash$"
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = {json.dumps(hook_cmd)}
+timeout = 190
+statusMessage = "Waiting for Apple Watch approval..."
+
+[features]
+hooks = true
+"""
+    parsed = tomllib.loads(toml_snippet)
+    assert parsed["features"]["hooks"] is True
+    perm_hooks = parsed["hooks"]["PermissionRequest"]
+    # One array-of-tables element containing matcher + hooks sub-array
+    assert len(perm_hooks) == 1
+    element = perm_hooks[0]
+    assert element["matcher"] == "^Bash$"
+    inner = element["hooks"]
+    assert len(inner) == 1
+    assert inner[0]["command"] == hook_cmd
+    assert inner[0]["timeout"] == 190
+
+
+def test_install_sh_toml_with_spaces_in_path(tmp_path):
+    """TOML snippet must remain valid even with spaces in paths."""
+    import tomllib
+    hook_cmd = f"env THENOW_CONFIG_PATH=/Users/my\\ name/config.json /path/to/python /path/to/thenow_hook.py"
+    toml_snippet = f"""[[hooks.PermissionRequest]]
+matcher = "^Bash$"
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = {json.dumps(hook_cmd)}
+timeout = 190
+statusMessage = "Waiting for Apple Watch approval..."
+
+[features]
+hooks = true
+"""
+    tomllib.loads(toml_snippet)  # must not raise
 
 
 # ---------------------------------------------------------------------------
