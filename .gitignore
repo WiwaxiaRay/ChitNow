@@ -30,3 +30,4 @@ xcuserdata/
 # macOS
 .DS_Store
 broker/certs/
+broker/config.json
