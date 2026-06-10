@@ -12,6 +12,7 @@ Relay failure is non-fatal: the broker logs a sanitised error and continues.
 The LAN polling fallback (Watch + iPhone polling /pending-requests every 5s)
 still handles delivery without relay.
 """
+import asyncio
 import hashlib
 import hmac
 import json
@@ -24,7 +25,13 @@ import httpx
 _DIR = os.path.dirname(os.path.abspath(__file__))
 RELAY_CREDS_PATH = os.path.join(_DIR, "relay_credentials.json")
 
-RELAY_TIMEOUT = 8  # seconds; fast fail so hook is not delayed
+_ATTEMPT_TIMEOUT = 6   # seconds per attempt
+_RETRY_DELAYS    = [2, 5, 15]  # seconds before 2nd, 3rd, 4th attempts
+
+# Push status — updated by push_notification(); read by get_relay_status()
+_last_push_ok: bool = False
+_last_push_ok_at: float | None = None
+_last_push_attempt_at: float | None = None
 
 
 def _load_relay_creds() -> dict | None:
@@ -72,9 +79,13 @@ async def push_notification() -> bool:
     """
     Send a generic wake-up push via the Relay Worker.
 
-    Returns True on success, False on any error (relay not configured, network
-    failure, auth error, rate limit). Caller should not raise on False.
+    Retries up to 3 times (4 total attempts) with delays of 2s, 5s, 15s.
+    Rate-limited (429) responses are not retried.
+    Returns True on success, False on all attempts failing.
+    Caller should not raise on False.
     """
+    global _last_push_ok, _last_push_ok_at, _last_push_attempt_at
+
     creds = _load_relay_creds()
     if not creds:
         return False
@@ -82,38 +93,56 @@ async def push_notification() -> bool:
     relay_url       = creds["relay_url"].rstrip("/")
     installation_id = creds["installation_id"]
     relay_secret    = creds["relay_secret"]
+    body_text       = json.dumps({"event": "approval_pending"})
 
-    body_text = json.dumps({"event": "approval_pending"})
-    auth_headers = _build_auth_headers("POST", "/v1/push", body_text, installation_id, relay_secret)
+    for attempt, delay_before in enumerate([0] + _RETRY_DELAYS):
+        if delay_before > 0:
+            await asyncio.sleep(delay_before)
 
-    try:
-        async with httpx.AsyncClient(timeout=RELAY_TIMEOUT) as client:
-            resp = await client.post(
-                f"{relay_url}/v1/push",
-                content=body_text,
-                headers={
-                    "Content-Type": "application/json",
-                    **auth_headers,
-                },
-            )
-        if resp.status_code == 200:
-            return True
-        # Log sanitised error — never log relay_secret, installation_id value, or JWT
-        reason = ""
+        _last_push_attempt_at = time.time()
+        auth_headers = _build_auth_headers("POST", "/v1/push", body_text, installation_id, relay_secret)
+
         try:
-            reason = resp.json().get("error", "")[:40]
-        except Exception:
-            pass
-        print(f"[relay] push failed {resp.status_code}: {reason}", flush=True)
-        return False
-    except Exception as e:
-        print(f"[relay] push error: {type(e).__name__}", flush=True)
-        return False
+            async with httpx.AsyncClient(timeout=_ATTEMPT_TIMEOUT) as client:
+                resp = await client.post(
+                    f"{relay_url}/v1/push",
+                    content=body_text,
+                    headers={"Content-Type": "application/json", **auth_headers},
+                )
+            if resp.status_code == 200:
+                _last_push_ok    = True
+                _last_push_ok_at = time.time()
+                return True
+            # Log sanitised error — never log relay_secret, installation_id value, or JWT
+            reason = ""
+            try:
+                reason = resp.json().get("error", "")[:40]
+            except Exception:
+                pass
+            if resp.status_code == 429:
+                print(f"[relay] push rate_limited (attempt {attempt + 1})", flush=True)
+                break  # don't retry on rate limit
+            print(f"[relay] push failed {resp.status_code}: {reason} (attempt {attempt + 1})", flush=True)
+        except Exception as e:
+            print(f"[relay] push error: {type(e).__name__} (attempt {attempt + 1})", flush=True)
+
+    _last_push_ok = False
+    return False
 
 
 def is_configured() -> bool:
     """Returns True if relay_credentials.json is present and complete."""
     return _load_relay_creds() is not None
+
+
+def get_relay_status() -> dict:
+    """Return relay status for the /health endpoint."""
+    return {
+        "configured": is_configured(),
+        "last_push_ok": _last_push_ok,
+        "last_push_ok_at": _last_push_ok_at,
+        "last_push_attempt_at": _last_push_attempt_at,
+    }
 
 
 def save_credentials(relay_url: str, installation_id: str, relay_secret: str) -> None:

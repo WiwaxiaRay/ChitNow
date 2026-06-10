@@ -8,8 +8,12 @@ CREATE TABLE IF NOT EXISTS installations (
   created_at        INTEGER  NOT NULL,           -- Unix epoch seconds
   last_seen_at      INTEGER  NOT NULL,
   revoked_at        INTEGER  DEFAULT NULL,       -- non-null = revoked
-  token_stale_at    INTEGER  DEFAULT NULL        -- non-null = APNs 410 received; update-token needed
+  token_stale_at    INTEGER  DEFAULT NULL,       -- non-null = APNs 410 received; update-token needed
+  key_version       INTEGER  NOT NULL DEFAULT 1  -- which RELAY_MASTER_SECRET_V{N} derived this installation
 );
+
+-- Migration for existing databases (run once if upgrading from schema without key_version):
+-- wrangler d1 execute chitnow-relay --command "ALTER TABLE installations ADD COLUMN key_version INTEGER NOT NULL DEFAULT 1"
 
 CREATE TABLE IF NOT EXISTS used_nonces (
   nonce           TEXT    NOT NULL,

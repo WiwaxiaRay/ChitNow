@@ -549,7 +549,7 @@ async def get_usage(x_api_key: str = Header("")):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "relay": relay_client.get_relay_status()}
 
 
 @app.get("/broker-ip")

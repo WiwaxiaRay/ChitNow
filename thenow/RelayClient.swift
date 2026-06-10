@@ -107,7 +107,6 @@ enum RelayClient {
             "environment":       "production",
         ]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: bodyDict) else { return false }
-        let bodyText = String(data: bodyData, encoding: .utf8) ?? "{}"
 
         var req = URLRequest(url: url)
         req.httpMethod = "POST"

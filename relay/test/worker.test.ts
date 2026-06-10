@@ -96,12 +96,15 @@ class MockD1Database {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const MASTER_SECRET = "test-master-secret";
+const MASTER_SECRET_V1 = "test-master-secret-v1";
+const MASTER_SECRET_V2 = "test-master-secret-v2";
 
-function makeMockEnv(db: MockD1Database) {
+function makeMockEnv(db: MockD1Database, opts: { activeVersion?: number } = {}) {
   return {
     DB: db as unknown as D1Database,
-    RELAY_MASTER_SECRET: MASTER_SECRET,
+    RELAY_MASTER_SECRET_V1: MASTER_SECRET_V1,
+    RELAY_MASTER_SECRET_V2: MASTER_SECRET_V2,
+    RELAY_ACTIVE_KEY_VERSION: String(opts.activeVersion ?? 1),
     APNS_PRIVATE_KEY: "fake-key",
     APNS_KEY_ID: "TESTKEY123",
     APNS_TEAM_ID: "TESTTEAM12",
@@ -450,6 +453,115 @@ describe("POST /v1/revoke", () => {
       env
     );
     expect(pushResp.status).toBe(401);
+  });
+});
+
+describe("POST /v1/rotate-secret", () => {
+  it("rotates installation from V1 to V2 and returns new relay_secret", async () => {
+    const envV1 = makeMockEnv(db, { activeVersion: 1 });
+    const envV2 = makeMockEnv(db, { activeVersion: 2 });
+
+    // Register under V1 active
+    const { installationId, relaySecret: v1Secret } = await registerInstallation(envV1);
+
+    // Rotate to V2 — authenticate with V1 secret (current), Worker returns V2 secret
+    const rotateBody = JSON.stringify({});
+    const rotateHeaders = await buildAuthHeaders("POST", "/v1/rotate-secret", rotateBody, installationId, v1Secret);
+    const rotateResp = await workerModule.fetch(
+      new Request("https://relay.example.com/v1/rotate-secret", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...rotateHeaders },
+        body: rotateBody,
+      }),
+      envV2
+    );
+    expect(rotateResp.status).toBe(200);
+    const rotateData = await rotateResp.json() as { relay_secret: string };
+    expect(typeof rotateData.relay_secret).toBe("string");
+    expect(rotateData.relay_secret).toHaveLength(64);
+    expect(rotateData.relay_secret).not.toBe(v1Secret);
+  });
+
+  it("new V2 secret authenticates push after rotation", async () => {
+    const envV1 = makeMockEnv(db, { activeVersion: 1 });
+    const envV2 = makeMockEnv(db, { activeVersion: 2 });
+
+    const { installationId, relaySecret: v1Secret } = await registerInstallation(envV1);
+
+    // Rotate
+    const rotateBody = JSON.stringify({});
+    const rotateHeaders = await buildAuthHeaders("POST", "/v1/rotate-secret", rotateBody, installationId, v1Secret);
+    const rotateResp = await workerModule.fetch(
+      new Request("https://relay.example.com/v1/rotate-secret", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...rotateHeaders },
+        body: rotateBody,
+      }),
+      envV2
+    );
+    expect(rotateResp.status).toBe(200);
+    const { relay_secret: v2Secret } = await rotateResp.json() as { relay_secret: string };
+
+    // Push with new V2 secret succeeds
+    const pushBody = JSON.stringify({ event: "approval_pending" });
+    const pushHeaders = await buildAuthHeaders("POST", "/v1/push", pushBody, installationId, v2Secret);
+    const pushResp = await workerModule.fetch(
+      new Request("https://relay.example.com/v1/push", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...pushHeaders },
+        body: pushBody,
+      }),
+      envV2
+    );
+    expect(pushResp.status).toBe(200);
+  });
+
+  it("old V1 secret rejected after rotation to V2", async () => {
+    const envV1 = makeMockEnv(db, { activeVersion: 1 });
+    const envV2 = makeMockEnv(db, { activeVersion: 2 });
+
+    const { installationId, relaySecret: v1Secret } = await registerInstallation(envV1);
+
+    // Rotate (consumes v1Secret nonce)
+    const rotateBody = JSON.stringify({});
+    const rotateHeaders = await buildAuthHeaders("POST", "/v1/rotate-secret", rotateBody, installationId, v1Secret);
+    await workerModule.fetch(
+      new Request("https://relay.example.com/v1/rotate-secret", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...rotateHeaders },
+        body: rotateBody,
+      }),
+      envV2
+    );
+
+    // Push with old V1 secret against V2 env — invalid_signature
+    const pushBody = JSON.stringify({ event: "approval_pending" });
+    const pushHeaders = await buildAuthHeaders("POST", "/v1/push", pushBody, installationId, v1Secret);
+    const pushResp = await workerModule.fetch(
+      new Request("https://relay.example.com/v1/push", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...pushHeaders },
+        body: pushBody,
+      }),
+      envV2
+    );
+    expect(pushResp.status).toBe(401);
+  });
+
+  it("returns 401 with wrong signature", async () => {
+    const { installationId } = await registerInstallation(env);
+
+    const rotateBody = JSON.stringify({});
+    const rotateHeaders = await buildAuthHeaders("POST", "/v1/rotate-secret", rotateBody, installationId, "wrong-secret-of-correct-length-!!!");
+    const resp = await workerModule.fetch(
+      new Request("https://relay.example.com/v1/rotate-secret", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...rotateHeaders },
+        body: rotateBody,
+      }),
+      env
+    );
+    expect(resp.status).toBe(401);
   });
 });
 

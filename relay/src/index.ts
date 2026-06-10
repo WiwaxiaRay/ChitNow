@@ -12,6 +12,7 @@
  *   POST /v1/update-token
  *   POST /v1/push
  *   POST /v1/revoke
+ *   POST /v1/rotate-secret
  */
 
 import {
@@ -37,14 +38,32 @@ const REG_RATE_WINDOW_SEC    = 3600;
 
 export interface Env {
   DB: D1Database;
-  // Secrets set via `wrangler secret put`:
-  RELAY_MASTER_SECRET: string;
+  // Versioned master secrets — set via `wrangler secret put`:
+  //   RELAY_MASTER_SECRET_V1  (required; used for key_version=1 installations)
+  //   RELAY_MASTER_SECRET_V2  (required when RELAY_ACTIVE_KEY_VERSION=2)
+  //   RELAY_ACTIVE_KEY_VERSION  "1" or "2" (default "1")
+  // Legacy: RELAY_MASTER_SECRET is treated as V1 if RELAY_MASTER_SECRET_V1 is not set.
+  RELAY_MASTER_SECRET_V1?: string;
+  RELAY_MASTER_SECRET_V2?: string;
+  RELAY_ACTIVE_KEY_VERSION?: string;
+  RELAY_MASTER_SECRET?: string;  // legacy alias; treated as V1
   APNS_PRIVATE_KEY: string;
   APNS_KEY_ID: string;
   APNS_TEAM_ID: string;
   APNS_BUNDLE_ID: string;
   // Optional: set to "sandbox" for development builds; defaults to production
   APNS_ENV?: string;
+}
+
+/** Return the master secret for a given key version, or null if not configured. */
+function getMasterSecret(env: Env, version: number): string | null {
+  if (version === 1) return env.RELAY_MASTER_SECRET_V1 ?? env.RELAY_MASTER_SECRET ?? null;
+  if (version === 2) return env.RELAY_MASTER_SECRET_V2 ?? null;
+  return null;
+}
+
+function activeKeyVersion(env: Env): number {
+  return parseInt(env.RELAY_ACTIVE_KEY_VERSION ?? "1", 10);
 }
 
 function json(data: unknown, status = 200): Response {
@@ -121,7 +140,6 @@ async function handleRegister(req: Request, env: Env): Promise<Response> {
   const apnsToken   = b.apns_device_token;
   const challengeId = b.challenge_id;
   const nonce       = b.nonce;
-  const environment = b.environment;
 
   if (typeof apnsToken !== "string" || apnsToken.length < 32) {
     return json({ error: "missing apns_device_token" }, 400);
@@ -154,17 +172,20 @@ async function handleRegister(req: Request, env: Env): Promise<Response> {
     return json({ error: "challenge_already_used" }, 409);
   }
 
-  // Generate installation credentials
+  // Derive relay_secret using the active key version
+  const keyVersion = activeKeyVersion(env);
+  const masterSecret = getMasterSecret(env, keyVersion);
+  if (!masterSecret) return json({ error: "service_unavailable", hint: "key version not configured" }, 503);
+
   const installationId = crypto.randomUUID();
-  // relay_secret is derived: HMAC-SHA256(RELAY_MASTER_SECRET, installationId)
-  const relaySecret = await deriveRelaySecret(env.RELAY_MASTER_SECRET, installationId);
-  const secretHash  = await sha256Hex(relaySecret);
+  const relaySecret    = await deriveRelaySecret(masterSecret, installationId);
+  const secretHash     = await sha256Hex(relaySecret);
   const now = nowSecs();
 
   await env.DB.prepare(
-    `INSERT INTO installations (installation_id, relay_secret_hash, apns_device_token, created_at, last_seen_at)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).bind(installationId, secretHash, apnsToken, now, now).run();
+    `INSERT INTO installations (installation_id, relay_secret_hash, apns_device_token, created_at, last_seen_at, key_version)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).bind(installationId, secretHash, apnsToken, now, now, keyVersion).run();
 
   // Track this registration for rate limiting
   await env.DB.prepare("INSERT INTO push_log (installation_id, pushed_at) VALUES (?,?)")
@@ -182,8 +203,8 @@ async function handleRegister(req: Request, env: Env): Promise<Response> {
  *
  * Order:
  *   1. Timestamp check (fast rejection)
- *   2. Load installation
- *   3. Verify HMAC
+ *   2. Load installation (includes key_version)
+ *   3. Verify HMAC using the installation's versioned master secret
  *   4. Atomically insert nonce (prevents replay)
  */
 async function verifyAuth(
@@ -197,15 +218,17 @@ async function verifyAuth(
   const drift = Math.abs(nowSecs() - authHeaders.timestamp);
   if (drift > TIMESTAMP_TOLERANCE_SECS) return "timestamp_out_of_range";
 
-  // 2. Load installation
+  // 2. Load installation (key_version determines which master secret to use)
   const inst = await env.DB.prepare(
-    "SELECT revoked_at FROM installations WHERE installation_id=?",
-  ).bind(authHeaders.installationId).first<{ revoked_at: number | null }>();
+    "SELECT revoked_at, key_version FROM installations WHERE installation_id=?",
+  ).bind(authHeaders.installationId).first<{ revoked_at: number | null; key_version: number }>();
   if (!inst) return "installation_not_found";
   if (inst.revoked_at !== null) return "installation_revoked";
 
-  // 3. Verify HMAC — derive relay_secret from master secret
-  const relaySecret = await deriveRelaySecret(env.RELAY_MASTER_SECRET, authHeaders.installationId);
+  // 3. Verify HMAC — derive relay_secret using the installation's key_version
+  const masterSecret = getMasterSecret(env, inst.key_version ?? 1);
+  if (!masterSecret) return "invalid_signature"; // version key not in env
+  const relaySecret = await deriveRelaySecret(masterSecret, authHeaders.installationId);
   const canonical   = await canonicalMessage(method, path, authHeaders.timestamp, authHeaders.nonce, bodyText);
   const expected    = await hmacSha256Hex(relaySecret, canonical);
   if (!safeEqual(expected, authHeaders.signature)) return "invalid_signature";
@@ -343,6 +366,40 @@ async function handleRevoke(req: Request, env: Env): Promise<Response> {
   return json({ status: "ok" });
 }
 
+// ── POST /v1/rotate-secret ────────────────────────────────────────────────────
+//
+// Migrates an installation from its current key_version to RELAY_ACTIVE_KEY_VERSION.
+// Auth uses the installation's CURRENT secret (old version). Returns the new secret.
+//
+// Client flow:
+//   1. Send request signed with current relay_secret.
+//   2. Save returned relay_secret to Keychain (replaces old secret).
+//   3. Send new relay_secret to Mac Broker via TLS-pinned LAN.
+//   Broker saves to relay_credentials.json (600).
+
+async function handleRotateSecret(req: Request, env: Env): Promise<Response> {
+  const authHeaders = parseAuthHeaders(req);
+  if (!authHeaders) return json({ error: "invalid_auth" }, 401);
+
+  const bodyText = await req.text();
+  const authErr = await verifyAuth(authHeaders, bodyText, "POST", "/v1/rotate-secret", env);
+  if (authErr) {
+    return json({ error: authErr }, authErr === "nonce_replayed" ? 409 : 401);
+  }
+
+  const newVersion = activeKeyVersion(env);
+  const newMasterSecret = getMasterSecret(env, newVersion);
+  if (!newMasterSecret) return json({ error: "key_version_unavailable" }, 503);
+
+  const newRelaySecret = await deriveRelaySecret(newMasterSecret, authHeaders.installationId);
+
+  await env.DB.prepare(
+    "UPDATE installations SET key_version=?, last_seen_at=? WHERE installation_id=?",
+  ).bind(newVersion, nowSecs(), authHeaders.installationId).run();
+
+  return json({ relay_secret: newRelaySecret });
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 export default {
@@ -352,12 +409,13 @@ export default {
     const path   = url.pathname;
 
     try {
-      if (method === "GET"  && path === "/health")          return handleHealth(env);
-      if (method === "GET"  && path === "/v1/challenge")    return handleChallenge(req, env);
-      if (method === "POST" && path === "/v1/register")     return handleRegister(req, env);
-      if (method === "POST" && path === "/v1/push")         return handlePush(req, env);
-      if (method === "POST" && path === "/v1/update-token") return handleUpdateToken(req, env);
-      if (method === "POST" && path === "/v1/revoke")       return handleRevoke(req, env);
+      if (method === "GET"  && path === "/health")             return handleHealth(env);
+      if (method === "GET"  && path === "/v1/challenge")       return handleChallenge(req, env);
+      if (method === "POST" && path === "/v1/register")        return handleRegister(req, env);
+      if (method === "POST" && path === "/v1/push")            return handlePush(req, env);
+      if (method === "POST" && path === "/v1/update-token")    return handleUpdateToken(req, env);
+      if (method === "POST" && path === "/v1/revoke")          return handleRevoke(req, env);
+      if (method === "POST" && path === "/v1/rotate-secret")   return handleRotateSecret(req, env);
       return json({ error: "not_found" }, 404);
     } catch (err) {
       console.error(`[relay] unhandled error: ${err instanceof Error ? err.message : "unknown"}`);

@@ -154,7 +154,7 @@ struct PairingView: View {
 
     /// Returns the cached APNs device token if already registered (set by AppDelegate on registration).
     private func currentDeviceToken() async -> String? {
-        (UIApplication.shared.delegate as? AppDelegate).flatMap { AppDelegate.deviceToken }
+        (UIApplication.shared.delegate as? AppDelegate).flatMap { _ in AppDelegate.deviceToken }
     }
 }
 
