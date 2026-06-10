@@ -6,7 +6,7 @@ enum WatchBrokerClient {
         #if targetEnvironment(simulator)
         return "http://localhost:8000"
         #else
-        return UserDefaults.standard.string(forKey: "brokerURL") ?? "http://172.30.87.117:8000"
+        return sharedDefaults.string(forKey: "brokerURL") ?? "http://172.30.87.117:8000"
         #endif
     }
     static let apiKey = "dev-key"

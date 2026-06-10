@@ -2,12 +2,19 @@ import WidgetKit
 import SwiftUI
 
 // ── 配置 ───────────────────────────────────────────────────────────────────────
-#if targetEnvironment(simulator)
-private let BROKER_URL = "http://localhost:8000"
-#else
-private let BROKER_URL = "http://dacidabeiwushouyehehuadeMacBook-Air.local:8000"
-#endif
 private let API_KEY = "dev-key"
+private let APP_GROUP = "group.com.wangyang.thenow"
+
+// Widget reads broker URL from the shared App Group written by the Watch App.
+// Falls back to localhost (simulator) or hardcoded IP (real device, first run).
+private var BROKER_URL: String {
+    #if targetEnvironment(simulator)
+    return "http://localhost:8000"
+    #else
+    let shared = UserDefaults(suiteName: APP_GROUP)
+    return shared?.string(forKey: "brokerURL") ?? "http://172.30.87.117:8000"
+    #endif
+}
 
 // ── 像素宠物（5×5）B=身体 e=眼睛 .=空 ─────────────────────────────────────────
 private let MINI_CLAUDE_ART = [

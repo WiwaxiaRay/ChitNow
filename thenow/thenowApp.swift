@@ -94,9 +94,14 @@ class PhoneSessionManager: NSObject, WCSessionDelegate {
 
     func pingWatchNewRequest() {
         guard WCSession.isSupported(),
-              WCSession.default.activationState == .activated,
-              WCSession.default.isReachable else { return }
-        WCSession.default.sendMessage(["ping": "newRequest"], replyHandler: nil, errorHandler: nil)
+              WCSession.default.activationState == .activated else { return }
+        let session = WCSession.default
+        // Immediate delivery when Watch app is in foreground.
+        if session.isReachable {
+            session.sendMessage(["ping": "newRequest"], replyHandler: nil, errorHandler: nil)
+        }
+        // Queued delivery — fires when Watch app next becomes active (works from watch face).
+        session.transferUserInfo(["ping": "newRequest"])
     }
 
     // 手表主动来问时，后台自动回复当前 IP，不需要用户手动开 App
