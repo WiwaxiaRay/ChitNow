@@ -3,9 +3,11 @@
 Claude Code PreToolUse hook for thenow approval broker.
 Exit 0 = allow, exit 1 = deny.
 
-Set env vars:
-  THENOW_BROKER_URL  (default: http://localhost:8000)
-  THENOW_API_KEY     (default: dev-key)
+Set env vars (optional overrides):
+  THENOW_BROKER_URL     broker HTTPS URL
+  THENOW_API_KEY        API key
+  THENOW_CERT_PATH      path to broker.crt for TLS pinning
+  THENOW_CONFIG_PATH    path to broker config.json (set by install.sh)
 """
 import json
 import os
@@ -13,6 +15,24 @@ import re
 import sys
 
 import httpx
+
+_DEBUG_LOG = "/tmp/thenow_hook_debug.log"
+_DEBUG = os.environ.get("THENOW_DEBUG") == "1"
+
+
+def _log_debug(msg: str):
+    if not _DEBUG:
+        return
+    try:
+        import stat
+        existed = os.path.exists(_DEBUG_LOG)
+        with open(_DEBUG_LOG, "a") as f:
+            f.write(msg + "\n")
+        if not existed:
+            os.chmod(_DEBUG_LOG, stat.S_IRUSR | stat.S_IWUSR)  # 600
+    except Exception:
+        pass
+
 
 def _load_broker_config() -> tuple[str, str, str | None]:
     """Returns (broker_url, api_key, cert_path). Env vars take priority."""
@@ -29,19 +49,25 @@ def _load_broker_config() -> tuple[str, str, str | None]:
             os.path.expanduser("~/chitnow/broker/config.json"),
             os.path.expanduser("~/thenow/broker/config.json"),
         ]
-        cfg_path = next((p for p in _candidates if os.path.exists(p)), _candidates[0])
-        try:
-            cfg  = json.loads(open(cfg_path).read())
-            url  = url  or f"https://localhost:8000"
-            key  = key  or cfg.get("api_key", "dev-key")
-            cert = cert or os.path.join(os.path.dirname(cfg_path), "certs", "broker.crt")
-        except Exception:
-            url = url or "https://localhost:8000"
-            key = key or "dev-key"
+        cfg_path = next((p for p in _candidates if os.path.exists(p)), None)
+        if cfg_path:
+            try:
+                cfg   = json.loads(open(cfg_path).read())
+                url   = url  or "https://localhost:8000"
+                key   = key  or cfg.get("api_key") or None
+                cert  = cert or os.path.join(os.path.dirname(cfg_path), "certs", "broker.crt")
+            except Exception as e:
+                _log_debug(f"[config] parse error: {e}")
+        else:
+            _log_debug("[config] config.json not found in any candidate path")
+        url = url or "https://localhost:8000"
     return url, key, cert
 
 BROKER_URL, API_KEY, CERT_PATH = _load_broker_config()
 TIMEOUT = 185  # slightly over broker's 180s
+
+# API_KEY is None when config.json cannot be found or has no key.
+# main() checks this and denies rather than falling back to a default.
 
 HIGH_RISK_PATTERNS = [
     r"rm\s+-[rf]",
@@ -78,17 +104,6 @@ def summarize(command: str) -> str:
     if re.search(r"sudo\b", c):
         return f"sudo: {c[:60]}"
     return c[:80]
-
-
-_DEBUG_LOG = "/tmp/thenow_hook_debug.log"
-
-
-def _log_debug(msg: str):
-    try:
-        with open(_DEBUG_LOG, "a") as f:
-            f.write(msg + "\n")
-    except Exception:
-        pass
 
 
 def _parse_input() -> tuple[str, str, str, str]:
@@ -200,6 +215,12 @@ def _exit_deny(message: str = "") -> None:
 def main():
     global _hook_event_name, _agent, _description
     command, cwd, agent, tool_name = _parse_input()
+
+    if not API_KEY:
+        print("[thenow] broker config not found — denying high-risk command", file=sys.stderr)
+        _log_debug("[main] API_KEY is None — denying")
+        _exit_deny("broker config not found")
+        return
 
     # PermissionRequest (Codex): send all commands to Watch
     # PreToolUse (Claude Code): only send high-risk commands

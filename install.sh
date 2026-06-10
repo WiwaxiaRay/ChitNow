@@ -12,6 +12,16 @@ SETTINGS="$HOME/.claude/settings.json"
 echo "==> ChitNow installer"
 echo "    Repo: $REPO"
 
+# ── 0. Python version check ────────────────────────────────────────────────────
+PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+PYTHON_MAJOR=$(python3 -c 'import sys; print(sys.version_info.major)')
+PYTHON_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
+if [ "$PYTHON_MAJOR" -lt 3 ] || { [ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 11 ]; }; then
+    echo "ERROR: Python 3.11+ required (found $PYTHON_VERSION)"
+    exit 1
+fi
+echo "    Python $PYTHON_VERSION OK"
+
 # ── 1. Python venv ─────────────────────────────────────────────────────────────
 echo "==> Setting up Python venv..."
 cd "$REPO/broker"
@@ -21,7 +31,6 @@ echo "    Done."
 
 # ── 2. Generate config + certs (idempotent) ───────────────────────────────────
 echo "==> Generating broker config and TLS cert..."
-cd "$REPO/broker"
 .venv/bin/python generate_config.py
 echo "    Done."
 
@@ -50,6 +59,9 @@ if [ ! -f "$SETTINGS" ]; then
     mkdir -p "$(dirname "$SETTINGS")"
     echo '{}' > "$SETTINGS"
 fi
+
+# Backup settings.json before modification
+cp "$SETTINGS" "${SETTINGS}.bak.$(date +%Y%m%d_%H%M%S)"
 
 # Merge hook entry into settings.json using the correct dict format
 python3 - "$SETTINGS" "$HOOK_CMD" <<'PYEOF'
@@ -80,14 +92,32 @@ with open(path, "w") as f:
 print("    settings.json updated.")
 PYEOF
 
-# ── 5. Done ────────────────────────────────────────────────────────────────────
+# ── 6. Done ────────────────────────────────────────────────────────────────────
+CODEX_HOOK_CMD="env THENOW_CONFIG_PATH=$CONFIG_PATH $REPO/broker/.venv/bin/python $HOOKS_DIR/thenow_hook.py"
+
 echo ""
 echo "==> Installation complete!"
 echo ""
 echo "Next steps:"
-echo "  1. Install the ChitNow iPhone app via TestFlight or Xcode."
-echo "  2. Open https://localhost:8000/pair in your Mac browser."
+echo "  1. Open https://localhost:8000/pair in your Mac browser."
 echo "     (Accept the certificate warning — it is self-signed and local.)"
-echo "  3. Scan the QR code in the ChitNow iPhone app to pair."
+echo "  2. Scan the QR code in the ChitNow app to pair."
 echo ""
+echo "─────────────────────────────────────────────────────────────"
+echo "  Codex users: add the following to ~/.codex/config.toml"
+echo "  then run /hooks in the Codex TUI to re-trust the hook."
+echo "─────────────────────────────────────────────────────────────"
+echo ""
+echo "[[hooks.PermissionRequest]]"
+echo "matcher = \"^Bash$\""
+echo "[[hooks.PermissionRequest.hooks]]"
+echo "type = \"command\""
+echo "command = \"$CODEX_HOOK_CMD\""
+echo "timeout = 190"
+echo "statusMessage = \"Waiting for Apple Watch approval...\""
+echo ""
+echo "[features]"
+echo "hooks = true"
+echo ""
+echo "─────────────────────────────────────────────────────────────"
 echo "To uninstall: bash uninstall.sh"

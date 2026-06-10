@@ -6,11 +6,19 @@ enum WatchBrokerClient {
         #if targetEnvironment(simulator)
         return "https://localhost:8000"
         #else
-        return sharedDefaults.string(forKey: "brokerURL") ?? "https://172.30.87.117:8000"
+        return sharedDefaults.string(forKey: "brokerURL") ?? ""
         #endif
     }
     static var apiKey: String {
-        sharedDefaults.string(forKey: "apiKey") ?? "dev-key"
+        sharedDefaults.string(forKey: "apiKey") ?? ""
+    }
+    static var isPaired: Bool {
+        #if targetEnvironment(simulator)
+        return true
+        #else
+        return sharedDefaults.string(forKey: "brokerURL") != nil
+            && sharedDefaults.string(forKey: "apiKey") != nil
+        #endif
     }
     private static var certFingerprint: String? {
         sharedDefaults.string(forKey: "certFingerprint")
@@ -25,6 +33,7 @@ enum WatchBrokerClient {
     }
 
     private static func makeRequest(_ path: String) -> URLRequest? {
+        guard isPaired else { return nil }
         guard let url = URL(string: "\(baseURL)\(path)") else { return nil }
         var req = URLRequest(url: url)
         req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")

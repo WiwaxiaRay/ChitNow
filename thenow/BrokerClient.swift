@@ -50,17 +50,17 @@ final class PinnedSessionDelegate: NSObject, URLSessionDelegate {
 
 enum BrokerClient {
     static var brokerURL: String {
-        KeychainHelper.brokerURL ?? fallbackURL
+        KeychainHelper.brokerURL ?? ""
     }
     static var apiKey: String {
-        KeychainHelper.apiKey ?? "dev-key"
+        KeychainHelper.apiKey ?? ""
     }
     static var certFingerprint: String? {
         KeychainHelper.certFingerprint
     }
-
-    // Fallback for first run before pairing (dev only)
-    private static let fallbackURL = "https://dacidabeiwushouyehehuadeMacBook-Air.local:8000"
+    static var isPaired: Bool {
+        KeychainHelper.brokerURL != nil && KeychainHelper.apiKey != nil
+    }
 
     // brokerIPURL is used by PhoneSessionManager to call /broker-ip
     static var brokerIPURL: String { brokerURL }

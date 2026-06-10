@@ -19,41 +19,53 @@ struct ContentView: View {
     var codexRequests:  [ApprovalRequest] { requests.filter {  $0.isCodex } }
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            WatchPageView(
-                theme:    .claude,
-                stats:    usage?.claude,
-                requests: claudeRequests,
-                error:    usageError,
-                onDecide: dismiss,
-                onRefresh: reloadAll
-            )
-            .tag(0)
+        if WatchBrokerClient.isPaired {
+            TabView(selection: $selectedTab) {
+                WatchPageView(
+                    theme:    .claude,
+                    stats:    usage?.claude,
+                    requests: claudeRequests,
+                    error:    usageError,
+                    onDecide: dismiss,
+                    onRefresh: reloadAll
+                )
+                .tag(0)
 
-            WatchPageView(
-                theme:    .gpt,
-                stats:    usage?.gpt,
-                requests: codexRequests,
-                error:    usageError,
-                onDecide: dismiss,
-                onRefresh: reloadAll
-            )
-            .tag(1)
-        }
-        .onAppear {
-            reloadAll()
-            WidgetCenter.shared.reloadAllTimelines()
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
+                WatchPageView(
+                    theme:    .gpt,
+                    stats:    usage?.gpt,
+                    requests: codexRequests,
+                    error:    usageError,
+                    onDecide: dismiss,
+                    onRefresh: reloadAll
+                )
+                .tag(1)
+            }
+            .onAppear {
                 reloadAll()
                 WidgetCenter.shared.reloadAllTimelines()
             }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active {
+                    reloadAll()
+                    WidgetCenter.shared.reloadAllTimelines()
+                }
+            }
+            .onReceive(approvalTimer) { _ in reloadApprovals() }
+            .onReceive(usageTimer)    { _ in reloadUsage() }
+            .onReceive(NotificationCenter.default.publisher(for: .brokerURLUpdated)) { _ in reloadAll() }
+            .onReceive(NotificationCenter.default.publisher(for: .newApprovalRequest)) { _ in reloadApprovals() }
+        } else {
+            VStack(spacing: 8) {
+                Text("Not Paired")
+                    .font(.headline)
+                Text("Open ChitNow on iPhone to pair")
+                    .font(.caption)
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+            }
+            .padding()
         }
-        .onReceive(approvalTimer) { _ in reloadApprovals() }
-        .onReceive(usageTimer)    { _ in reloadUsage() }
-        .onReceive(NotificationCenter.default.publisher(for: .brokerURLUpdated)) { _ in reloadAll() }
-        .onReceive(NotificationCenter.default.publisher(for: .newApprovalRequest)) { _ in reloadApprovals() }
     }
 
     private func dismiss(_ id: String) {

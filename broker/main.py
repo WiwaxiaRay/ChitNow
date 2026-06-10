@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import secrets
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -31,14 +32,18 @@ DB_PATH     = os.path.join(_DIR, "broker.db")
 TIMEOUT_SEC = 180
 
 def _load_api_key() -> str:
-    # Env var takes priority (dev override / Mac Helper sets it via launchd)
     if os.environ.get("THENOW_API_KEY"):
         return os.environ["THENOW_API_KEY"]
     cfg_path = os.path.join(_DIR, "config.json")
     try:
-        return json.loads(open(cfg_path).read())["api_key"]
-    except Exception:
-        return "dev-key"
+        key = json.loads(open(cfg_path).read()).get("api_key", "")
+        if not key:
+            raise ValueError("api_key missing or empty in config.json")
+        return key
+    except Exception as e:
+        print(f"[broker] FATAL: cannot load API key from {cfg_path}: {e}", flush=True)
+        print("[broker] Run: python generate_config.py", flush=True)
+        sys.exit(1)
 
 def _load_cert_fingerprint() -> str:
     fp_path = os.path.join(_DIR, "certs", "fingerprint.txt")

@@ -13,7 +13,7 @@ When Claude Code or Codex wants to run a high-risk command (`rm -rf`, `git push 
 - Same Wi-Fi network as your Mac (LAN-only — no cloud relay)
 - **Optional:** [codexbar](https://github.com/steipete/codexbar) for token/cost display on Watch
 
-> **Note:** Push notifications require configuring your own Apple Developer account (APNs key, Team ID, Bundle ID). Without this, the Watch app still works via 5-second polling — you will receive approvals within 5 seconds but without instant vibration. See [APNs Setup](#apns-setup).
+> **Note:** When the Watch app is open, ChitNow checks for approval requests approximately every 5 seconds. Reliable background alerts require APNs — see [APNs Setup](#apns-setup) to configure your own Apple Developer account.
 
 ## Install
 
@@ -29,7 +29,7 @@ bash install.sh
 3. Copies the hook script to `~/.claude/scripts/`
 4. Adds the PreToolUse hook entry to `~/.claude/settings.json`
 
-After installation, install the iPhone app via TestFlight or Xcode, then pair:
+After installation, install the iPhone app via Xcode, then pair:
 
 ```
 Open in browser on your Mac: https://localhost:8000/pair
@@ -43,12 +43,15 @@ Scan the QR code in the ChitNow iPhone app to complete pairing.
 
 Add to `~/.codex/config.toml`, then re-trust in the Codex TUI (`/hooks`):
 
+Run `bash install.sh` — it prints the exact config snippet with absolute paths for your system. Paste the output into `~/.codex/config.toml`, then run `/hooks` in the Codex TUI to re-trust.
+
 ```toml
 [[hooks.PermissionRequest]]
 matcher = "^Bash$"
 [[hooks.PermissionRequest.hooks]]
 type = "command"
-command = "/path/to/thenow/broker/.venv/bin/python ~/.claude/scripts/thenow_hook.py"
+# Replace /ABSOLUTE/PATH with your actual clone path (install.sh prints this for you)
+command = "env THENOW_CONFIG_PATH=/ABSOLUTE/PATH/thenow/broker/config.json /ABSOLUTE/PATH/thenow/broker/.venv/bin/python ~/.claude/scripts/thenow_hook.py"
 timeout = 190
 statusMessage = "Waiting for Apple Watch approval..."
 

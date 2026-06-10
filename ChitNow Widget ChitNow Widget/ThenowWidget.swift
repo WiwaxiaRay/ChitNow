@@ -11,11 +11,19 @@ private var BROKER_URL: String {
     #if targetEnvironment(simulator)
     return "https://localhost:8000"
     #else
-    return _shared?.string(forKey: "brokerURL") ?? "https://172.30.87.117:8000"
+    return _shared?.string(forKey: "brokerURL") ?? ""
     #endif
 }
 private var API_KEY: String {
-    _shared?.string(forKey: "apiKey") ?? "dev-key"
+    _shared?.string(forKey: "apiKey") ?? ""
+}
+private var IS_PAIRED: Bool {
+    #if targetEnvironment(simulator)
+    return true
+    #else
+    return _shared?.string(forKey: "brokerURL") != nil
+        && _shared?.string(forKey: "apiKey") != nil
+    #endif
 }
 private var CERT_FP: String? {
     _shared?.string(forKey: "certFingerprint")
@@ -160,6 +168,7 @@ private func loadCache() -> WidgetEntry? {
 // ── 网络请求 ───────────────────────────────────────────────────────────────────
 
 private func fetchEntry() async -> WidgetEntry {
+    guard IS_PAIRED else { return .empty }
     async let u = fetchUsage()
     async let p = fetchPendingCount()
     let (usage, pending) = await (u, p)
