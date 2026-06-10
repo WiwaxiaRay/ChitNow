@@ -1,0 +1,21 @@
+name = "chitnow-relay"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "chitnow-relay"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# Secrets (set with `wrangler secret put`):
+#   APNS_PRIVATE_KEY   — contents of AuthKey_KEYID.p8 (without PEM headers)
+#   APNS_KEY_ID        — 10-char APNs key ID (e.g. ZRLVNRQ23Q)
+#   APNS_TEAM_ID       — 10-char Apple Team ID (e.g. F7PJZAN683)
+#   APNS_BUNDLE_ID     — App bundle ID (e.g. com.wangyang.thenow)
+#
+# Set them:
+#   wrangler secret put APNS_PRIVATE_KEY
+#   wrangler secret put APNS_KEY_ID
+#   wrangler secret put APNS_TEAM_ID
+#   wrangler secret put APNS_BUNDLE_ID
