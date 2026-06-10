@@ -115,13 +115,24 @@ class PhoneSessionManager: NSObject, WCSessionDelegate {
             guard let url = URL(string: "\(BrokerClient.brokerIPURL)/broker-ip") else { return }
             var req = URLRequest(url: url)
             req.setValue(BrokerClient.sharedApiKey, forHTTPHeaderField: "X-API-Key")
-            guard let (data, _) = try? await URLSession.shared.data(for: req),
+            let pinnedSession: URLSession
+            if let fp = KeychainHelper.certFingerprint, !fp.isEmpty {
+                pinnedSession = URLSession(configuration: .default,
+                                          delegate: PinnedSessionDelegate(fingerprint: fp),
+                                          delegateQueue: nil)
+            } else {
+                pinnedSession = URLSession.shared
+            }
+            guard let (data, _) = try? await pinnedSession.data(for: req),
                   let obj = try? JSONDecoder().decode([String: String].self, from: data),
                   let brokerURL = obj["url"] else {
                 replyHandler([:])
                 return
             }
-            try? session.updateApplicationContext(["brokerURL": brokerURL])
+            var ctx: [String: Any] = ["brokerURL": brokerURL]
+            if let fp  = KeychainHelper.certFingerprint { ctx["certFingerprint"] = fp }
+            if let key = KeychainHelper.apiKey          { ctx["apiKey"] = key }
+            try? session.updateApplicationContext(ctx)
             replyHandler(["brokerURL": brokerURL])
         }
     }

@@ -93,6 +93,8 @@ struct PairingView: View {
                         apiKey:          payload.key,
                         certFingerprint: payload.fp
                     )
+                    // Re-register APNs so the newly paired broker receives our token
+                    UIApplication.shared.registerForRemoteNotifications()
                     // Propagate to Watch
                     BrokerClient.discoverAndShareWithWatch()
                     onPaired()

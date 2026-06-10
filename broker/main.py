@@ -16,9 +16,14 @@ from typing import AsyncGenerator
 import aiosqlite
 import httpx
 import jwt
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
+
+# ── vendored assets ───────────────────────────────────────────────────────────
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+with open(os.path.join(_STATIC_DIR, "qrcode.min.js")) as _f:
+    _QRCODE_JS = _f.read()
 
 # ── config ────────────────────────────────────────────────────────────────────
 _DIR        = os.path.dirname(os.path.abspath(__file__))
@@ -688,8 +693,12 @@ def _current_https_url() -> str:
 
 
 @app.get("/pair", response_class=HTMLResponse)
-async def pair_page():
+async def pair_page(request: Request):
     """Open in browser on Mac. Shows a one-time QR code for iPhone to scan."""
+    # Restrict to localhost — the QR payload contains the long-term API key
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="Pairing page is only accessible from localhost")
     # Expire stale sessions
     now = time.time()
     stale = [k for k, v in _pairing_sessions.items() if v["expires_at"] < now]
@@ -732,7 +741,7 @@ async def pair_page():
 <div id="qr"></div>
 <div id="timer">Expires in <span id="secs">300</span>s — <a href="/pair" style="color:#888">refresh</a></div>
 <div id="status">✓ Paired successfully</div>
-<script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
+<script>{_QRCODE_JS}</script>
 <script>
 const data = {payload_json};
 QRCode.toCanvas(document.createElement('canvas'), JSON.stringify(data), {{

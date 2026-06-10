@@ -71,7 +71,7 @@ def ensure_certs() -> str:
     key = ec.generate_private_key(ec.SECP256R1())
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "thenow-broker")])
     san = x509.SubjectAlternativeName(
-        [x509.IPAddress(ip) for ip in _lan_ips()]
+        [x509.DNSName("localhost")] + [x509.IPAddress(ip) for ip in _lan_ips()]
     )
     now = datetime.datetime.now(datetime.timezone.utc)
     cert = (
