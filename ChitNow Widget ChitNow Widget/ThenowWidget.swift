@@ -2,8 +2,12 @@ import WidgetKit
 import SwiftUI
 
 // ── 配置 ───────────────────────────────────────────────────────────────────────
-private let BROKER_URL = "http://172.30.87.117:8000"
-private let API_KEY    = "dev-key"
+#if targetEnvironment(simulator)
+private let BROKER_URL = "http://localhost:8000"
+#else
+private let BROKER_URL = "http://dacidabeiwushouyehehuadeMacBook-Air.local:8000"
+#endif
+private let API_KEY = "dev-key"
 
 // ── 像素宠物（5×5）B=身体 e=眼睛 .=空 ─────────────────────────────────────────
 private let MINI_CLAUDE_ART = [
