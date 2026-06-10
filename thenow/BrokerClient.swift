@@ -2,6 +2,10 @@ import Foundation
 import CryptoKit
 import WatchConnectivity
 
+extension Notification.Name {
+    static let certMismatch = Notification.Name("thenow.certMismatch")
+}
+
 // MARK: - Pinned URLSession
 
 final class PinnedSessionDelegate: NSObject, URLSessionDelegate {
@@ -34,6 +38,9 @@ final class PinnedSessionDelegate: NSObject, URLSessionDelegate {
             completionHandler(.useCredential, URLCredential(trust: serverTrust))
         } else {
             print("[thenow] cert pin mismatch: got \(fp)")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .certMismatch, object: nil)
+            }
             completionHandler(.cancelAuthenticationChallenge, nil)
         }
     }
@@ -66,6 +73,16 @@ enum BrokerClient {
         }
         // No fingerprint yet (pre-pairing) — trust all for local dev
         return URLSession.shared
+    }
+
+    static func checkHealth() async -> (reachable: Bool, latencyMs: Int) {
+        guard let url = URL(string: "\(brokerURL)/health") else { return (false, 0) }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 5
+        let start = Date()
+        guard let (_, resp) = try? await makeSession().data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200 else { return (false, 0) }
+        return (true, Int(Date().timeIntervalSince(start) * 1000))
     }
 
     static func registerDevice(token: String) async {
