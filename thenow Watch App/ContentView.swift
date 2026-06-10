@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var usageError: String?
     @State private var selectedTab = 0
     @State private var dismissedIDs: Set<String> = []
+    @State private var knownRequestIDs: Set<String> = []
     @Environment(\.scenePhase) private var scenePhase
 
     private let approvalTimer = Timer.publish(every: 5,  on: .main, in: .common).autoconnect()
@@ -53,13 +54,11 @@ struct ContentView: View {
         .onReceive(usageTimer)    { _ in reloadUsage() }
         .onReceive(NotificationCenter.default.publisher(for: .brokerURLUpdated)) { _ in reloadAll() }
         .onReceive(NotificationCenter.default.publisher(for: .newApprovalRequest)) { _ in reloadApprovals() }
-        .onChange(of: requests) { oldVal, newVal in
-            autoNavigate(newVal, previous: oldVal)
-        }
     }
 
     private func dismiss(_ id: String) {
         dismissedIDs.insert(id)
+        knownRequestIDs.remove(id)
         requests.removeAll { $0.id == id }
         reloadApprovals()
     }
@@ -68,7 +67,19 @@ struct ContentView: View {
         Task {
             let fetched = await WatchBrokerClient.fetchPending()
             let active  = fetched.filter { $0.remainingSeconds > 0 && !dismissedIDs.contains($0.id) }
-            await MainActor.run { requests = active }
+            await MainActor.run {
+                let newIDs = Set(active.map { $0.id }).subtracting(knownRequestIDs)
+                if !newIDs.isEmpty {
+                    // Navigate to the first new request's tab and play haptic.
+                    // Runs on main actor so WKInterfaceDevice is always called from main thread.
+                    if let first = active.first(where: { newIDs.contains($0.id) }) {
+                        withAnimation { selectedTab = first.isCodex ? 1 : 0 }
+                    }
+                    WKInterfaceDevice.current().play(.notification)
+                }
+                knownRequestIDs = Set(active.map { $0.id })
+                requests = active
+            }
         }
     }
 
@@ -90,11 +101,5 @@ struct ContentView: View {
         reloadUsage()
     }
 
-    private func autoNavigate(_ reqs: [ApprovalRequest], previous: [ApprovalRequest]) {
-        let previousIds = Set(previous.map { $0.id })
-        if let first = reqs.first(where: { !previousIds.contains($0.id) }) {
-            withAnimation { selectedTab = first.isCodex ? 1 : 0 }
-            WKInterfaceDevice.current().play(.notification)
-        }
-    }
+
 }

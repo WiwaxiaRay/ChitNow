@@ -33,22 +33,28 @@ class WatchSessionManager: NSObject, WCSessionDelegate {
         guard session.isReachable else { return }
         session.sendMessage(["request": "brokerURL"], replyHandler: { reply in
             guard let url = reply["brokerURL"] as? String else { return }
-            UserDefaults.standard.set(url, forKey: "brokerURL")
-            NotificationCenter.default.post(name: .brokerURLUpdated, object: nil)
-            print("[watch] broker URL refreshed: \(url)")
+            DispatchQueue.main.async {
+                UserDefaults.standard.set(url, forKey: "brokerURL")
+                NotificationCenter.default.post(name: .brokerURLUpdated, object: nil)
+                print("[watch] broker URL refreshed: \(url)")
+            }
         }, errorHandler: { _ in })
     }
 
     func session(_ session: WCSession, didReceiveApplicationContext context: [String: Any]) {
         guard let url = context["brokerURL"] as? String else { return }
-        UserDefaults.standard.set(url, forKey: "brokerURL")
-        NotificationCenter.default.post(name: .brokerURLUpdated, object: nil)
-        print("[watch] broker URL updated: \(url)")
+        DispatchQueue.main.async {
+            UserDefaults.standard.set(url, forKey: "brokerURL")
+            NotificationCenter.default.post(name: .brokerURLUpdated, object: nil)
+            print("[watch] broker URL updated: \(url)")
+        }
     }
 
     func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
         if message["ping"] as? String == "newRequest" {
-            NotificationCenter.default.post(name: .newApprovalRequest, object: nil)
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .newApprovalRequest, object: nil)
+            }
         }
     }
 }

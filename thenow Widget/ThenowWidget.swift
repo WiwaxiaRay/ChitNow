@@ -2,8 +2,12 @@ import WidgetKit
 import SwiftUI
 
 // ── 配置 ───────────────────────────────────────────────────────────────────────
-private let BROKER_MDNS = "http://dacidabeiwushouyehehuadeMacBook-Air.local:8000"
-private let API_KEY     = "dev-key"
+#if targetEnvironment(simulator)
+private let BROKER_BASE = "http://localhost:8000"
+#else
+private let BROKER_BASE = "http://dacidabeiwushouyehehuadeMacBook-Air.local:8000"
+#endif
+private let API_KEY = "dev-key"
 
 // ── 像素宠物（5×5） ────────────────────────────────────────────────────────────
 // B=身体  e=眼睛  .=空
@@ -92,14 +96,14 @@ private func fetchEntry() async -> WidgetEntry {
 }
 
 private func fetchUsage() async -> UsageResp? {
-    guard let url = URL(string: "\(BROKER_MDNS)/usage") else { return nil }
+    guard let url = URL(string: "\(BROKER_BASE)/usage") else { return nil }
     var r = URLRequest(url: url); r.setValue(API_KEY, forHTTPHeaderField: "X-API-Key"); r.timeoutInterval = 8
     guard let (data, _) = try? await URLSession.shared.data(for: r) else { return nil }
     return try? JSONDecoder().decode(UsageResp.self, from: data)
 }
 
 private func fetchPendingCount() async -> Int {
-    guard let url = URL(string: "\(BROKER_MDNS)/pending-requests") else { return 0 }
+    guard let url = URL(string: "\(BROKER_BASE)/pending-requests") else { return 0 }
     var r = URLRequest(url: url); r.setValue(API_KEY, forHTTPHeaderField: "X-API-Key"); r.timeoutInterval = 8
     guard let (data, _) = try? await URLSession.shared.data(for: r),
           let items = try? JSONDecoder().decode([PendingItem].self, from: data) else { return 0 }
