@@ -1,0 +1,122 @@
+"""
+Relay client for ChitNow broker.
+
+Calls the Cloudflare Worker /v1/push endpoint using HMAC-SHA256 authentication.
+The Relay is responsible for forwarding a generic APNs push to the paired iPhone.
+
+The relay credentials (relay_url, installation_id, relay_secret) are stored in
+relay_credentials.json (600) alongside config.json. They are populated when the
+paired iPhone registers with the Worker and sends the credentials back via pairing.
+
+Relay failure is non-fatal: the broker logs a sanitised error and continues.
+The LAN polling fallback (Watch + iPhone polling /pending-requests every 5s)
+still handles delivery without relay.
+"""
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import time
+
+import httpx
+
+_DIR = os.path.dirname(os.path.abspath(__file__))
+RELAY_CREDS_PATH = os.path.join(_DIR, "relay_credentials.json")
+
+RELAY_TIMEOUT = 8  # seconds; fast fail so hook is not delayed
+
+
+def _load_relay_creds() -> dict | None:
+    """Returns relay credentials dict or None if not configured."""
+    try:
+        with open(RELAY_CREDS_PATH) as f:
+            creds = json.load(f)
+        if creds.get("relay_url") and creds.get("installation_id") and creds.get("relay_secret"):
+            return creds
+    except Exception:
+        pass
+    return None
+
+
+def _hmac_sha256_hex(secret: str, message: str) -> str:
+    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+
+
+def _build_auth_payload(installation_id: str, relay_secret: str) -> dict:
+    """Build the HMAC-signed auth fields for /v1/push."""
+    timestamp = int(time.time())
+    nonce = secrets.token_hex(16)
+    message = f"{installation_id}:{timestamp}:{nonce}"
+    sig = _hmac_sha256_hex(relay_secret, message)
+    return {
+        "installation_id": installation_id,
+        "timestamp": timestamp,
+        "nonce": nonce,
+        "hmac": sig,
+    }
+
+
+async def push_notification() -> bool:
+    """
+    Send a generic wake-up push via the Relay Worker.
+
+    Returns True on success, False on any error (relay not configured, network
+    failure, auth error, rate limit). Caller should not raise on False.
+    """
+    creds = _load_relay_creds()
+    if not creds:
+        return False
+
+    relay_url     = creds["relay_url"].rstrip("/")
+    installation_id = creds["installation_id"]
+    relay_secret  = creds["relay_secret"]
+
+    payload = _build_auth_payload(installation_id, relay_secret)
+
+    try:
+        async with httpx.AsyncClient(timeout=RELAY_TIMEOUT) as client:
+            resp = await client.post(f"{relay_url}/v1/push", json=payload)
+        if resp.status_code == 200:
+            return True
+        # Log sanitised error — never log relay_secret, installation_id value, or JWT
+        reason = ""
+        try:
+            reason = resp.json().get("error", "")[:40]
+        except Exception:
+            pass
+        print(f"[relay] push failed {resp.status_code}: {reason}", flush=True)
+        return False
+    except Exception as e:
+        print(f"[relay] push error: {type(e).__name__}", flush=True)
+        return False
+
+
+def is_configured() -> bool:
+    """Returns True if relay_credentials.json is present and complete."""
+    return _load_relay_creds() is not None
+
+
+def save_credentials(relay_url: str, installation_id: str, relay_secret: str) -> None:
+    """Write relay credentials to relay_credentials.json (mode 600).
+    Called after the iPhone sends credentials back via the pairing confirm endpoint.
+    """
+    creds = {
+        "relay_url": relay_url,
+        "installation_id": installation_id,
+        "relay_secret": relay_secret,
+    }
+    with open(RELAY_CREDS_PATH, "w") as f:
+        json.dump(creds, f, indent=2)
+    os.chmod(RELAY_CREDS_PATH, 0o600)
+    print(f"[relay] credentials saved to {RELAY_CREDS_PATH}", flush=True)
+
+
+def delete_credentials() -> None:
+    """Remove relay credentials (called on uninstall or data purge)."""
+    try:
+        if os.path.exists(RELAY_CREDS_PATH):
+            os.remove(RELAY_CREDS_PATH)
+            print("[relay] credentials deleted", flush=True)
+    except Exception as e:
+        print(f"[relay] delete failed: {type(e).__name__}", flush=True)

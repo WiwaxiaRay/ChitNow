@@ -29,7 +29,6 @@ def client(monkeypatch, tmp_path):
     _make_config(tmp_path)
     db_path = str(tmp_path / "test_broker.db")
     monkeypatch.setenv("THENOW_API_KEY", "test-key-abc123")
-    monkeypatch.setenv("THENOW_APNS_ENV", "sandbox")
 
     import sys
     if "main" in sys.modules:
@@ -257,34 +256,35 @@ def test_cancel_approved_request_returns_409(client):
 
 
 # ---------------------------------------------------------------------------
-# Test: APNs not configured — send_push must not raise
+# Test: relay push — must not block or raise when relay is not configured
 # ---------------------------------------------------------------------------
 
-def test_send_push_no_p8_does_not_raise(client, monkeypatch, tmp_path):
-    """send_push() must be a no-op when .p8 is absent, never raise."""
+def test_relay_push_not_configured_does_not_raise(client):
+    """relay_client.push_notification() must return False silently when relay not configured."""
     c, broker_main = client
-    monkeypatch.setattr(broker_main, "APNS_KEY_PATH", str(tmp_path / "missing.p8"))
     import asyncio
-    asyncio.run(broker_main.send_push("fake-token", "title", "body", "req-1"))
+    result = asyncio.run(broker_main.relay_client.push_notification())
+    assert result is False
 
 
-def test_push_broker_url_no_p8_does_not_raise(client, monkeypatch, tmp_path):
-    """_push_broker_url() must not raise or propagate when .p8 absent."""
-    c, broker_main = client
-    monkeypatch.setattr(broker_main, "APNS_KEY_PATH", str(tmp_path / "missing.p8"))
-    import asyncio
-    asyncio.run(broker_main._push_broker_url("https://192.168.1.1:8000"))
-
-
-def test_create_request_without_apns_succeeds(client, monkeypatch, tmp_path):
-    """POST /approval-requests must succeed even when APNs is not configured."""
-    c, broker_main = client
-    monkeypatch.setattr(broker_main, "APNS_KEY_PATH", str(tmp_path / "missing.p8"))
-    r = c.post("/approval-requests", headers=HEADERS, json={
+def test_create_request_without_relay_succeeds(client):
+    """POST /approval-requests must succeed even when relay is not configured."""
+    r = client[0].post("/approval-requests", headers=HEADERS, json={
         "agent": "claude-code", "risk": "high",
         "title": "t", "summary": "s", "command": "rm -rf /x", "cwd": "/",
     })
     assert r.status_code == 200
+
+
+def test_relay_credentials_endpoint_without_relay_url(client):
+    """POST /relay-credentials must return 400 when broker has no relay_url configured."""
+    c, broker_main = client
+    # RELAY_URL is "" in test environment (no config.json with relay_url)
+    r = c.post("/relay-credentials", headers=HEADERS, json={
+        "installation_id": "test-id",
+        "relay_secret": "test-secret",
+    })
+    assert r.status_code == 400
 
 
 # ---------------------------------------------------------------------------

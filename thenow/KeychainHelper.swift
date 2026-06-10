@@ -4,9 +4,12 @@ import Security
 enum KeychainHelper {
     private static let service = "com.wangyang.thenow"
 
-    static var brokerURL:       String? { read(key: "brokerURL") }
-    static var apiKey:          String? { read(key: "apiKey") }
-    static var certFingerprint: String? { read(key: "certFingerprint") }
+    static var brokerURL:         String? { read(key: "brokerURL") }
+    static var apiKey:            String? { read(key: "apiKey") }
+    static var certFingerprint:   String? { read(key: "certFingerprint") }
+    static var relayInstallationId: String? { read(key: "relayInstallationId") }
+    static var relaySecret:       String? { read(key: "relaySecret") }
+    static var relayURL:          String? { read(key: "relayURL") }
 
     static func save(brokerURL: String, apiKey: String, certFingerprint: String) {
         set(key: "brokerURL",       value: brokerURL)
@@ -14,14 +17,31 @@ enum KeychainHelper {
         set(key: "certFingerprint", value: certFingerprint)
     }
 
+    static func setRelayURL(_ url: String) {
+        set(key: "relayURL", value: url)
+    }
+
+    static func saveRelay(url: String, installationId: String, secret: String) {
+        set(key: "relayURL",            value: url)
+        set(key: "relayInstallationId", value: installationId)
+        set(key: "relaySecret",         value: secret)
+    }
+
     static func clear() {
         delete(key: "brokerURL")
         delete(key: "apiKey")
         delete(key: "certFingerprint")
+        delete(key: "relayURL")
+        delete(key: "relayInstallationId")
+        delete(key: "relaySecret")
     }
 
     static var isConfigured: Bool {
         brokerURL != nil && apiKey != nil && certFingerprint != nil
+    }
+
+    static var isRelayConfigured: Bool {
+        relayURL != nil && relayInstallationId != nil && relaySecret != nil
     }
 
     private static func set(key: String, value: String) {

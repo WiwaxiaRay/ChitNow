@@ -101,6 +101,11 @@ enum BrokerClient {
         await post(path: "/register-device", body: ["device_token": token])
     }
 
+    static func sendRelayCredentials(installationId: String, secret: String) async {
+        await post(path: "/relay-credentials",
+                   body: ["installation_id": installationId, "relay_secret": secret])
+    }
+
     static func postDecision(requestId: String, decision: String) async {
         await post(path: "/decision/\(requestId)", body: ["status": decision])
     }

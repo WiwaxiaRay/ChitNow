@@ -4,12 +4,13 @@ import AVFoundation
 // MARK: - QR payload
 
 private struct PairingPayload: Decodable {
-    let v:   Int
-    let url: String
-    let pt:  String   // one-time pairing token
-    let fp:  String
-    let exp: Int
-    let sid: String
+    let v:         Int
+    let url:       String
+    let pt:        String   // one-time pairing token
+    let fp:        String
+    let exp:       Int
+    let sid:       String
+    let relay_url: String?  // optional — present when broker has relay configured
 }
 
 private struct ConfirmResponse: Decodable {
@@ -91,7 +92,16 @@ struct PairingView: View {
         }
         confirming = true
         Task {
-            let resp = await confirmWithBroker(payload: payload)
+            // Register with relay Worker first (if relay URL is in QR payload)
+            var relayCreds: RelayClient.Credentials? = nil
+            if let relayURL = payload.relay_url, !relayURL.isEmpty {
+                let deviceToken = await currentDeviceToken()
+                if let token = deviceToken {
+                    relayCreds = await RelayClient.registerOrUpdate(deviceToken: token, relayURL: relayURL)
+                }
+            }
+
+            let resp = await confirmWithBroker(payload: payload, relayCreds: relayCreds)
             await MainActor.run {
                 confirming = false
                 if let resp {
@@ -100,6 +110,10 @@ struct PairingView: View {
                         apiKey:          resp.api_key,
                         certFingerprint: resp.cert_fp
                     )
+                    // Persist relay URL so AppDelegate can register with relay when APNs token arrives
+                    if let relayURL = payload.relay_url, !relayURL.isEmpty {
+                        KeychainHelper.setRelayURL(relayURL)
+                    }
                     UIApplication.shared.registerForRemoteNotifications()
                     BrokerClient.discoverAndShareWithWatch()
                     onPaired()
@@ -110,12 +124,24 @@ struct PairingView: View {
         }
     }
 
-    private func confirmWithBroker(payload: PairingPayload) async -> ConfirmResponse? {
+    private func confirmWithBroker(payload: PairingPayload,
+                                   relayCreds: RelayClient.Credentials?) async -> ConfirmResponse? {
         guard let url = URL(string: "\(payload.url)/pair/\(payload.sid)/confirm") else { return nil }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue(payload.pt, forHTTPHeaderField: "X-Pairing-Token")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.timeoutInterval = 10
+
+        // Send relay credentials to broker so it can send push notifications via relay.
+        var body: [String: String] = [:]
+        if let creds = relayCreds {
+            body["relay_url"]        = creds.relayURL
+            body["installation_id"]  = creds.installationId
+            body["relay_secret"]     = creds.relaySecret
+        }
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
         let delegate = PinnedSessionDelegate(fingerprint: payload.fp)
         let session  = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
         guard let (data, resp) = try? await session.data(for: req),
@@ -124,6 +150,11 @@ struct PairingView: View {
               let result = try? JSONDecoder().decode(ConfirmResponse.self, from: data)
         else { return nil }
         return result
+    }
+
+    /// Returns the cached APNs device token if already registered (set by AppDelegate on registration).
+    private func currentDeviceToken() async -> String? {
+        (UIApplication.shared.delegate as? AppDelegate).flatMap { AppDelegate.deviceToken }
     }
 }
 

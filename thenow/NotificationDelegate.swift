@@ -7,7 +7,7 @@ class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         let approve = UNNotificationAction(
             identifier: "APPROVE",
             title: "Approve",
-            options: []
+            options: [.authenticationRequired]
         )
         let deny = UNNotificationAction(
             identifier: "DENY",

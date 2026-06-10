@@ -8,6 +8,7 @@ struct ContentView: View {
         Group {
             if isPaired {
                 ActiveView(onUnpair: {
+                    Task { await RelayClient.revoke() }
                     KeychainHelper.clear()
                     isPaired = false
                 })
@@ -17,6 +18,7 @@ struct ContentView: View {
         }
         .alert("Certificate Changed", isPresented: $showCertAlert) {
             Button("Re-pair Now") {
+                Task { await RelayClient.revoke() }
                 KeychainHelper.clear()
                 isPaired = false
             }

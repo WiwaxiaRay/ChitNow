@@ -14,6 +14,10 @@ struct thenowApp: App {
 }
 
 class AppDelegate: NSObject, UIApplicationDelegate {
+    /// Cached APNs device token (hex string). Set on first registration and on token refresh.
+    /// Read by PairingView so relay Worker registration can happen during the pairing flow.
+    static var deviceToken: String?
+
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
@@ -46,8 +50,19 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
     ) {
         let token = deviceToken.map { String(format: "%02x", $0) }.joined()
-        print("[thenow] device token: \(token)")
-        Task { await BrokerClient.registerDevice(token: token) }
+        print("[thenow] device token: \(token.prefix(12))…")
+        AppDelegate.deviceToken = token
+        Task {
+            await BrokerClient.registerDevice(token: token)
+            // Register / update token with relay Worker, then push creds to broker.
+            // This handles both the post-pairing first-registration and APNs token rotations.
+            if let relayURL = KeychainHelper.relayURL, !relayURL.isEmpty,
+               let creds = await RelayClient.registerOrUpdate(deviceToken: token, relayURL: relayURL),
+               BrokerClient.isPaired {
+                await BrokerClient.sendRelayCredentials(installationId: creds.installationId,
+                                                        secret: creds.relaySecret)
+            }
+        }
     }
 
     func application(

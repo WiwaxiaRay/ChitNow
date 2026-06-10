@@ -25,10 +25,16 @@ def ensure_config() -> dict:
         try:
             cfg = json.loads(open(CONFIG_PATH).read())
             if cfg.get("api_key"):
+                # Add relay_url field if missing (idempotent upgrade)
+                if "relay_url" not in cfg:
+                    cfg["relay_url"] = ""
+                    with open(CONFIG_PATH, "w") as f:
+                        json.dump(cfg, f, indent=2)
+                    os.chmod(CONFIG_PATH, 0o600)
                 return cfg
         except Exception:
             pass
-    cfg = {"api_key": secrets.token_hex(32)}
+    cfg = {"api_key": secrets.token_hex(32), "relay_url": ""}
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
     os.chmod(CONFIG_PATH, 0o600)

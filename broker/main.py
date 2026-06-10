@@ -15,8 +15,7 @@ from datetime import datetime, timezone, timedelta
 from typing import AsyncGenerator
 
 import aiosqlite
-import httpx
-import jwt
+import relay_client  # noqa: E402 — same-directory module
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
@@ -55,19 +54,17 @@ def _load_cert_fingerprint() -> str:
 API_KEY          = _load_api_key()
 CERT_FINGERPRINT = _load_cert_fingerprint()
 
-# Fill these after downloading APNs .p8 key from Apple Developer portal
-APNS_KEY_ID    = "ZRLVNRQ23Q"
-APNS_TEAM_ID   = "F7PJZAN683"
-APNS_KEY_PATH  = os.path.join(_DIR, "AuthKey_ZRLVNRQ23Q.p8")
-BUNDLE_ID      = "com.wangyang.thenow"
-_APNS_ENV  = os.environ.get("THENOW_APNS_ENV", "sandbox")  # "sandbox" | "production"
-APNS_HOST  = "https://api.push.apple.com" if _APNS_ENV == "production" else "https://api.sandbox.push.apple.com"
+def _load_relay_url() -> str:
+    cfg_path = os.path.join(_DIR, "config.json")
+    try:
+        return json.loads(open(cfg_path).read()).get("relay_url", "")
+    except Exception:
+        return ""
+
+RELAY_URL = _load_relay_url()
 
 # ── in-memory SSE waiters ─────────────────────────────────────────────────────
 _waiters: dict[str, asyncio.Event] = {}
-_apns_token: str | None = None
-_apns_token_at: float = 0
-_apns_lock = asyncio.Lock()  # guards concurrent JWT regeneration
 
 
 # ── database ──────────────────────────────────────────────────────────────────
@@ -107,80 +104,10 @@ async def init_db():
         await db.commit()
 
 
-# ── APNs ──────────────────────────────────────────────────────────────────────
-def apns_configured() -> bool:
-    """Returns True only when the .p8 key file is present on disk."""
-    return bool(
-        APNS_KEY_ID and APNS_TEAM_ID and BUNDLE_ID
-        and os.path.isfile(APNS_KEY_PATH)
-    )
-
-
-async def _apns_auth_token() -> str:
-    global _apns_token, _apns_token_at
-    now = time.time()
-    if _apns_token and now - _apns_token_at < 3000:
-        return _apns_token
-    async with _apns_lock:
-        # Re-check after acquiring lock — another coroutine may have refreshed it.
-        if _apns_token and now - _apns_token_at < 3000:
-            return _apns_token
-        with open(APNS_KEY_PATH) as f:
-            key = f.read()
-        _apns_token = jwt.encode(
-            {"iss": APNS_TEAM_ID, "iat": int(now)},
-            key,
-            algorithm="ES256",
-            headers={"kid": APNS_KEY_ID},
-        )
-        _apns_token_at = now
-    return _apns_token
-
-
-async def send_push(device_token: str, title: str, body: str, request_id: str):
-    if not apns_configured():
-        print("[APNs] not configured — skipping alert push", flush=True)
-        return
-    payload = {
-        "aps": {
-            "alert": {"title": title, "body": body},
-            "category": "AGENT_APPROVAL",
-            "sound": "default",
-            "interruption-level": "time-sensitive",
-            "content-available": 1,
-        },
-        "request_id": request_id,
-        "type": "approval_request",
-    }
-    try:
-        headers = {
-            "authorization": f"bearer {await _apns_auth_token()}",
-            "apns-topic": BUNDLE_ID,
-            "apns-push-type": "alert",
-            "apns-priority": "10",
-        }
-        async with httpx.AsyncClient(http2=True) as client:
-            resp = await client.post(
-                f"{APNS_HOST}/3/device/{device_token}",
-                json=payload,
-                headers=headers,
-                timeout=10,
-            )
-        if resp.status_code == 200:
-            print(f"[APNs] push sent: {request_id}", flush=True)
-        else:
-            # Log only status + reason — never log JWT, device token, or full response
-            reason = resp.json().get("reason", "unknown") if resp.content else "empty"
-            print(f"[APNs] error {resp.status_code}: {reason}", flush=True)
-    except Exception as e:
-        print(f"[APNs] push failed: {type(e).__name__}", flush=True)
-
-
 # ── app ───────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    asyncio.create_task(_startup_push())
     asyncio.create_task(_ip_monitor())
     yield
 
@@ -197,57 +124,10 @@ def _current_ip() -> str | None:
         return None
 
 
-async def _push_broker_url(broker_url: str, label: str = "push") -> None:
-    if not apns_configured():
-        print(f"[{label}] APNs not configured — skipping silent push", flush=True)
-        return
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT device_token FROM devices WHERE id='default'")
-            row = await cur.fetchone()
-        if not row:
-            print(f"[{label}] no device registered", flush=True)
-            return
-        payload = {
-            "aps": {"content-available": 1},
-            "type": "broker_started",
-            "broker_url": broker_url,
-        }
-        headers = {
-            "authorization": f"bearer {await _apns_auth_token()}",
-            "apns-topic": BUNDLE_ID,
-            "apns-push-type": "background",
-            "apns-priority": "5",
-        }
-        async with httpx.AsyncClient(http2=True) as client:
-            resp = await client.post(
-                f"{APNS_HOST}/3/device/{row[0]}",
-                json=payload, headers=headers, timeout=10,
-            )
-        if resp.status_code == 200:
-            print(f"[{label}] silent push sent", flush=True)
-        else:
-            reason = resp.json().get("reason", "unknown") if resp.content else "empty"
-            print(f"[{label}] APNs error {resp.status_code}: {reason}", flush=True)
-    except Exception as e:
-        print(f"[{label}] failed: {type(e).__name__}", flush=True)
-
-
-async def _startup_push():
-    await asyncio.sleep(2)
-    ip = _current_ip()
-    if ip:
-        await _push_broker_url(f"https://{ip}:8000", label="startup push")
-    else:
-        print("[startup push] cannot determine local IP", flush=True)
-
-
 async def _ip_monitor():
-    """每 60s 检测 IP 变化；顺带清理 _waiters 中已无对应 pending 行的孤儿 event。"""
-    last_ip: str | None = None
+    """每 60s 清理 _waiters 中已无对应 pending 行的孤儿 event。"""
     while True:
         await asyncio.sleep(60)
-        # Clean up orphaned waiters (requests that expired while hook was disconnected)
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 cur = await db.execute(
@@ -261,16 +141,6 @@ async def _ip_monitor():
                 print(f"[ip monitor] cleaned {len(stale)} orphaned waiter(s)", flush=True)
         except Exception:
             pass
-        ip = _current_ip()
-        if ip is None:
-            continue
-        if last_ip is None:
-            last_ip = ip
-            continue
-        if ip != last_ip:
-            last_ip = ip
-            print(f"[ip monitor] IP changed → {ip}", flush=True)
-            await _push_broker_url(f"https://{ip}:8000", label="ip monitor")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -294,6 +164,15 @@ class RequestBody(BaseModel):
 
 class DecisionBody(BaseModel):
     status: str  # "approved" | "denied"
+
+class PairConfirmBody(BaseModel):
+    relay_url: str = ""
+    installation_id: str = ""
+    relay_secret: str = ""
+
+class RelayCredentialsBody(BaseModel):
+    installation_id: str
+    relay_secret: str
 
 
 # ── routes ────────────────────────────────────────────────────────────────────
@@ -324,16 +203,10 @@ async def create_request(body: RequestBody, x_api_key: str = Header("")):
             (req_id, body.agent, body.risk, body.title, body.summary,
              body.command, body.cwd, expires_at.isoformat()),
         )
-        cur = await db.execute("SELECT device_token FROM devices WHERE id='default'")
-        row = await cur.fetchone()
         await db.commit()
 
     _waiters[req_id] = asyncio.Event()
-
-    if row:
-        asyncio.create_task(
-            send_push(row[0], body.title, body.summary, req_id)
-        )
+    asyncio.create_task(relay_client.push_notification())
 
     print(f"[broker] created {req_id}: {body.summary[:40]}")
     return {"id": req_id, "expires_at": expires_at.isoformat()}
@@ -773,6 +646,8 @@ async def pair_page(request: Request):
         "exp": int(expires_at),
         "sid": sid,
     }
+    if RELAY_URL:
+        payload["relay_url"] = RELAY_URL
     _pairing_sessions[sid] = {
         "pairing_token": pairing_token,
         "url": broker_url,
@@ -843,8 +718,10 @@ const poll = setInterval(async () => {{
 
 
 @app.post("/pair/{sid}/confirm")
-async def pair_confirm(sid: str, x_pairing_token: str = Header("")):
-    """Called by iPhone after scanning QR. Returns api_key only after validating the one-time token."""
+async def pair_confirm(sid: str, body: PairConfirmBody = PairConfirmBody(),
+                       x_pairing_token: str = Header("")):
+    """Called by iPhone after scanning QR. Returns api_key only after validating the one-time token.
+    Optionally accepts relay credentials so the broker can send push notifications via the relay."""
     session = _pairing_sessions.get(sid)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found or expired")
@@ -856,6 +733,8 @@ async def pair_confirm(sid: str, x_pairing_token: str = Header("")):
     if x_pairing_token != session["pairing_token"]:
         raise HTTPException(status_code=401, detail="Invalid pairing token")
     session["used"] = True
+    if body.relay_url and body.installation_id and body.relay_secret:
+        relay_client.save_credentials(body.relay_url, body.installation_id, body.relay_secret)
     print(f"[pair] iPhone confirmed pairing session {sid}", flush=True)
     return {
         "status":     "ok",
@@ -863,6 +742,17 @@ async def pair_confirm(sid: str, x_pairing_token: str = Header("")):
         "broker_url": session["url"],
         "cert_fp":    session["fp"],
     }
+
+
+@app.post("/relay-credentials")
+async def update_relay_credentials(body: RelayCredentialsBody, x_api_key: str = Header("")):
+    """Called by iPhone after relay Worker registration to give the broker its push credentials.
+    Used both on first pairing (if APNs token was not yet available) and on APNs token refresh."""
+    auth(x_api_key)
+    if not RELAY_URL:
+        raise HTTPException(status_code=400, detail="Relay not configured on this broker")
+    relay_client.save_credentials(RELAY_URL, body.installation_id, body.relay_secret)
+    return {"status": "ok"}
 
 
 @app.get("/pair/{sid}/status")

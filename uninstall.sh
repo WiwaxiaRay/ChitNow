@@ -62,8 +62,9 @@ echo "    Remove the [[hooks.PermissionRequest]] block containing thenow_hook.py
 # ── Purge run data (opt-in) ───────────────────────────────────────────────────
 if [ "$PURGE_DATA" = "1" ]; then
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)/broker"
-    [ -f "$SCRIPT_DIR/broker.db"  ] && rm "$SCRIPT_DIR/broker.db"  && echo "    Removed broker.db"
-    [ -f "$SCRIPT_DIR/broker.log" ] && rm "$SCRIPT_DIR/broker.log" && echo "    Removed broker.log"
+    [ -f "$SCRIPT_DIR/broker.db"              ] && rm "$SCRIPT_DIR/broker.db"              && echo "    Removed broker.db"
+    [ -f "$SCRIPT_DIR/broker.log"             ] && rm "$SCRIPT_DIR/broker.log"             && echo "    Removed broker.log"
+    [ -f "$SCRIPT_DIR/relay_credentials.json" ] && rm "$SCRIPT_DIR/relay_credentials.json" && echo "    Removed relay_credentials.json"
     echo "    Run data purged."
 else
     echo ""
