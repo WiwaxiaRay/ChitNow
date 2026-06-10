@@ -50,7 +50,8 @@ APNS_KEY_ID    = "ZRLVNRQ23Q"
 APNS_TEAM_ID   = "F7PJZAN683"
 APNS_KEY_PATH  = os.path.join(_DIR, "AuthKey_ZRLVNRQ23Q.p8")
 BUNDLE_ID      = "com.wangyang.thenow"
-APNS_HOST      = "https://api.sandbox.push.apple.com"
+_APNS_ENV  = os.environ.get("THENOW_APNS_ENV", "sandbox")  # "sandbox" | "production"
+APNS_HOST  = "https://api.push.apple.com" if _APNS_ENV == "production" else "https://api.sandbox.push.apple.com"
 
 # ── in-memory SSE waiters ─────────────────────────────────────────────────────
 _waiters: dict[str, asyncio.Event] = {}
