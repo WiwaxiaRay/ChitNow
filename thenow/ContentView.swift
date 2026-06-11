@@ -55,69 +55,110 @@ struct ActiveView: View {
     @State private var routingError: String?
 
     var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "checkmark.shield.fill")
-                .font(.system(size: 48))
-                .foregroundStyle(.green)
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 24) {
+                    VStack(spacing: 8) {
+                        Image(systemName: "checkmark.shield.fill")
+                            .font(.system(size: 52))
+                            .foregroundStyle(.green)
 
-            Text("thenow")
-                .font(.title2.bold())
+                        Text("Approval guard active")
+                            .font(.title2.bold())
 
-            Text("Agent approval guard active")
-                .foregroundStyle(.secondary)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Toggle("Use Apple Watch for approvals", isOn: Binding(
-                    get: { watchApprovalsEnabled },
-                    set: { enabled in
-                        Task { await updateApprovalRouting(enabled) }
+                        Text("Choose where high-risk commands are approved.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
                     }
-                ))
-                .disabled(!routingLoaded || routingUpdating)
 
-                Text(watchApprovalsEnabled
-                     ? "High-risk commands wait for approval on Apple Watch."
-                     : "High-risk commands use the native Claude Code or Codex approval screen.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("APPROVAL METHOD")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
 
-                if let routingError {
-                    Text(routingError)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
-            }
-            .padding(.horizontal)
+                        if routingLoaded {
+                            approvalModeButton(
+                                title: "Apple Watch",
+                                detail: "Approve or deny from your wrist.",
+                                systemImage: "applewatch",
+                                enabled: true
+                            )
 
-            if let url = KeychainHelper.brokerURL {
-                Text(url)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
+                            approvalModeButton(
+                                title: "Claude Code / Codex",
+                                detail: "Use the agent's native approval screen.",
+                                systemImage: "terminal",
+                                enabled: false
+                            )
+                        } else {
+                            HStack(spacing: 12) {
+                                ProgressView()
+                                Text("Loading approval settings from Mac…")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding()
+                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                        }
 
-            HStack(spacing: 20) {
-                Button {
-                    showDiagnostics = true
-                } label: {
-                    Label("Diagnostics", systemImage: "network")
-                        .font(.footnote)
-                }
+                        if routingUpdating {
+                            ProgressView("Updating approval method…")
+                                .font(.caption)
+                        }
 
-                Button("Unpair", role: .destructive) {
-                    showUnpairConfirm = true
-                }
-                .font(.footnote)
-            }
-            .padding(.top, 4)
+                        if let routingError {
+                            Label(routingError, systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        }
+                    }
 
-            Link(destination: chitNowWebsiteURL) {
-                Label("Website & Setup Guide", systemImage: "safari")
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("MAC CONNECTION")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+
+                        VStack(spacing: 12) {
+                            if let url = KeychainHelper.brokerURL {
+                                Label {
+                                    Text(url)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                } icon: {
+                                    Image(systemName: "desktopcomputer")
+                                }
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+
+                            Button {
+                                showDiagnostics = true
+                            } label: {
+                                Label("Connection Diagnostics", systemImage: "network")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+
+                            Link(destination: chitNowWebsiteURL) {
+                                Label("Website & Setup Guide", systemImage: "safari")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        .padding()
+                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    }
+
+                    Button("Unpair This Mac", role: .destructive) {
+                        showUnpairConfirm = true
+                    }
                     .font(.footnote)
+                }
+                .padding()
             }
+            .navigationTitle("ChitNow")
         }
-        .padding()
         .task { await loadApprovalRouting() }
         .sheet(isPresented: $showDiagnostics) {
             DiagnosticsView()
@@ -128,6 +169,55 @@ struct ActiveView: View {
         } message: {
             Text("You will need to scan the QR code again to reconnect.")
         }
+    }
+
+    private func approvalModeButton(
+        title: String,
+        detail: String,
+        systemImage: String,
+        enabled: Bool
+    ) -> some View {
+        Button {
+            guard watchApprovalsEnabled != enabled else { return }
+            Task { await updateApprovalRouting(enabled) }
+        } label: {
+            HStack(spacing: 14) {
+                Image(systemName: systemImage)
+                    .font(.title2)
+                    .frame(width: 30)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.headline)
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Image(systemName: watchApprovalsEnabled == enabled
+                      ? "checkmark.circle.fill"
+                      : "circle")
+                    .font(.title2)
+                    .foregroundStyle(watchApprovalsEnabled == enabled ? .green : .secondary)
+            }
+            .multilineTextAlignment(.leading)
+            .padding()
+            .background(
+                watchApprovalsEnabled == enabled ? Color.green.opacity(0.12) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 16)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(
+                        watchApprovalsEnabled == enabled ? Color.green : Color.secondary.opacity(0.25),
+                        lineWidth: watchApprovalsEnabled == enabled ? 2 : 1
+                    )
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(routingUpdating)
     }
 
     private func loadApprovalRouting() async {
