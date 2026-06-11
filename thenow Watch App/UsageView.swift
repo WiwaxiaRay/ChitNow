@@ -228,6 +228,8 @@ struct WatchPageView: View {
 
     var body: some View {
         GeometryReader { geo in
+            let compact = geo.size.width <= 205
+
             ZStack(alignment: .top) {
                 Color.black.ignoresSafeArea()
 
@@ -242,11 +244,11 @@ struct WatchPageView: View {
                             color: theme.accent
                         )
                         .padding(.horizontal, 8)
-                        .padding(.bottom, 14)
+                        .padding(.bottom, compact ? 8 : 14)
                     } else {
-                        terminal
+                        terminal(compact: compact)
                             .padding(.horizontal, 8)
-                            .padding(.bottom, 14)
+                            .padding(.bottom, compact ? 8 : 14)
                     }
                 }
                 .offset(y: -35)
@@ -318,34 +320,40 @@ struct WatchPageView: View {
 
     // MARK: Terminal block
 
-    private var terminal: some View {
+    private func terminal(compact: Bool) -> some View {
         let rows: [(key: String, val: String, col: Color)] = [
             ("5-HR", fiveHrLabel, theme.ring5),
             ("WEEK", weekLabel,   theme.ringW),
             ("TKN ", tknLabel,    theme.sub),
         ]
+        let valueFontSize: CGFloat = compact ? 9 : 11
+        let keyFontSize: CGFloat = compact ? 8 : 10
+        let promptFontSize: CGFloat = compact ? 9 : 11
 
-        return VStack(alignment: .leading, spacing: 5) {
+        return VStack(alignment: .leading, spacing: compact ? 2 : 5) {
             ForEach(Array(rows.enumerated()), id: \.offset) { i, row in
                 HStack(alignment: .firstTextBaseline, spacing: 0) {
                     Text("> ")
                         .foregroundStyle(theme.accent)
-                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .font(.system(size: promptFontSize, weight: .bold, design: .monospaced))
                     Text(row.key + "  ")
                         .foregroundStyle(row.col)
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .font(.system(size: keyFontSize, weight: .semibold, design: .monospaced))
                     Text(row.val)
                         .foregroundStyle(theme.textColor)
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced).monospacedDigit())
-                    if i == rows.count - 1 {
+                        .font(.system(size: valueFontSize, weight: .semibold, design: .monospaced).monospacedDigit())
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.72)
+                        .layoutPriority(1)
+                    if i == rows.count - 1 && !compact {
                         BlinkCursor(color: theme.accent)
                             .font(.system(size: 11, weight: .bold, design: .monospaced))
                     }
                 }
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
+        .padding(.horizontal, compact ? 7 : 10)
+        .padding(.vertical, compact ? 5 : 7)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 10)
