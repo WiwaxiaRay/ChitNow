@@ -3,22 +3,15 @@ import CryptoKit
 
 enum WatchBrokerClient {
     static var baseURL: String {
-        #if targetEnvironment(simulator)
-        return "https://localhost:8000"
-        #else
         return sharedDefaults.string(forKey: "brokerURL") ?? ""
-        #endif
     }
     static var apiKey: String {
         sharedDefaults.string(forKey: "apiKey") ?? ""
     }
     static var isPaired: Bool {
-        #if targetEnvironment(simulator)
-        return true
-        #else
         return sharedDefaults.string(forKey: "brokerURL") != nil
             && sharedDefaults.string(forKey: "apiKey") != nil
-        #endif
+            && sharedDefaults.string(forKey: "certFingerprint") != nil
     }
     static var watchApprovalsEnabled: Bool {
         if sharedDefaults.object(forKey: "watchApprovalsEnabled") == nil {
@@ -31,11 +24,8 @@ enum WatchBrokerClient {
     }
 
     private static func makeSession() -> URLSession {
-        if let fp = certFingerprint, !fp.isEmpty {
-            let delegate = WatchPinnedDelegate(fingerprint: fp)
-            return URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
-        }
-        return URLSession.shared
+        let delegate = WatchPinnedDelegate(fingerprint: certFingerprint ?? "")
+        return URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
     }
 
     private static func makeRequest(_ path: String) -> URLRequest? {

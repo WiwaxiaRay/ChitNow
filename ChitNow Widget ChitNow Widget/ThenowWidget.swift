@@ -8,22 +8,15 @@ private let APP_GROUP = "group.com.wangyang.thenow"
 private let _shared   = UserDefaults(suiteName: APP_GROUP)
 
 private var BROKER_URL: String {
-    #if targetEnvironment(simulator)
-    return "https://localhost:8000"
-    #else
     return _shared?.string(forKey: "brokerURL") ?? ""
-    #endif
 }
 private var API_KEY: String {
     _shared?.string(forKey: "apiKey") ?? ""
 }
 private var IS_PAIRED: Bool {
-    #if targetEnvironment(simulator)
-    return true
-    #else
     return _shared?.string(forKey: "brokerURL") != nil
         && _shared?.string(forKey: "apiKey") != nil
-    #endif
+        && _shared?.string(forKey: "certFingerprint") != nil
 }
 private var CERT_FP: String? {
     _shared?.string(forKey: "certFingerprint")
@@ -31,7 +24,7 @@ private var CERT_FP: String? {
 
 // Cert-pinning URLSession for widget network requests
 private func makePinnedSession() -> URLSession {
-    guard let fp = CERT_FP, !fp.isEmpty else { return URLSession.shared }
+    let fp = CERT_FP ?? ""
     return URLSession(configuration: .default,
                       delegate: WidgetPinnedDelegate(fingerprint: fp),
                       delegateQueue: nil)

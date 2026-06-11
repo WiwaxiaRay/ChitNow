@@ -44,6 +44,10 @@ struct PairingView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
 
+            Text("Approval method settings appear after pairing.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
             if confirming {
                 ProgressView("Confirming…")
             } else {

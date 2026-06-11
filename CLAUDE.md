@@ -214,7 +214,7 @@ IP change recovery:
 ### Watch App (`thenow Watch App/`)
 
 - `WatchSessionManager.swift` — `WCSessionDelegate`; reads `brokerURL`, `apiKey`, `certFingerprint` from incoming context; writes all three to `sharedDefaults` (App Group)
-- `WatchBrokerClient.swift` — reads credentials from `UserDefaults(suiteName: "group.com.wangyang.thenow")`; `WatchPinnedDelegate` pins TLS; `#if targetEnvironment(simulator)` uses `localhost`
+- `WatchBrokerClient.swift` — reads complete paired credentials from `UserDefaults(suiteName: "group.com.wangyang.thenow")`; `WatchPinnedDelegate` pins TLS; simulators do not bypass pairing
 - `ContentView.swift` — `TabView` (tag 0=Claude, tag 1=ChatGPT); new-request detection via `knownRequestIDs: Set<String>`; `dismissedIDs` prevents reappearing cards
 - `UsageView.swift` — `PendingRequestCard` uses `CardCountdown: ObservableObject` (`@StateObject`) for stable countdown — struct-level Timer resets on re-render
 
