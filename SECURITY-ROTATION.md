@@ -4,7 +4,7 @@
 
 **Affected commit:** `8ea2df7580a0b9204e032d1428e34c39b402005b`  
 **Affected file:** `broker/config.json`  
-**Leaked secret:** API key `REDACTED_BROKER_API_KEY`  
+**Leaked secret:** A historical Broker API key (value intentionally redacted)
 **Gitignore fix:** commit `dfeecc3ca72bb533b4e704061b8d328e8610880d` (added broker/config.json to .gitignore)  
 **Disclosure scope:** Commit is in the public repo history on GitHub.
 

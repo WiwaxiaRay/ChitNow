@@ -67,40 +67,24 @@ else
     _fail "broker/config.json is NOT gitignored"
 fi
 
-# ── 4. Known-leaked API key in TRACKED (git-indexed) files ───────────────────
-LEAKED_KEY="REDACTED_BROKER_API_KEY"
-# Exclude: scripts/ (rotation/scan tools that reference the key legitimately),
-#          broker/tests/ (test fixtures that reference the key for testing),
-#          SECURITY-ROTATION.md (remediation documentation).
-TRACKED_WITH_KEY=$(git ls-files | \
-    grep -vE "^(scripts/|broker/tests/|SECURITY-ROTATION\.md)" | \
-    xargs grep -l "$LEAKED_KEY" 2>/dev/null || true)
-if [ -n "$TRACKED_WITH_KEY" ]; then
-    echo "$TRACKED_WITH_KEY" | while IFS= read -r f; do
-        _fail "Known-leaked API key in tracked file: $f"
-    done
-else
-    _pass "Known-leaked API key not in any tracked file"
-fi
-
-# ── 5. Active config.json uses leaked key (working tree only, not git error) ──
+# ── 4. Active config.json contains a plausible generated key ─────────────────
 if [ -f broker/config.json ]; then
     ACTIVE_KEY=$(python3 -c "import json; print(json.load(open('broker/config.json')).get('api_key',''))" 2>/dev/null || true)
-    if [ "$ACTIVE_KEY" = "$LEAKED_KEY" ]; then
-        _fail "Active broker/config.json still uses the known-leaked API key — run: python3 scripts/rotate_broker_credentials.py"
+    if [[ "$ACTIVE_KEY" =~ ^[0-9a-f]{64}$ ]]; then
+        _pass "Active broker/config.json contains a valid generated API key"
     else
-        _pass "Active broker/config.json uses a different (non-leaked) API key"
+        _fail "Active broker/config.json API key is missing or invalid — run: python3 scripts/rotate_broker_credentials.py"
     fi
 fi
 
-# ── 6. relay_credentials.json not committed ───────────────────────────────────
+# ── 5. relay_credentials.json not committed ───────────────────────────────────
 if git ls-files | grep -q "relay_credentials.json"; then
     _fail "relay_credentials.json is tracked by git"
 else
     _pass "relay_credentials.json not tracked by git"
 fi
 
-# ── 7. Local env/Cloudflare state cannot be committed ────────────────────────
+# ── 6. Local env/Cloudflare state cannot be committed ────────────────────────
 TRACKED_LOCAL_STATE=$(git ls-files | grep -E \
     '(^|/)(\.env(\..+)?|\.dev\.vars(\..+)?|\.wrangler/)' | \
     grep -vE '(\.env\.example|\.dev\.vars\.example)$' || true)
@@ -115,21 +99,21 @@ fi
 echo ""
 echo "==> Scanning git history for secrets..."
 
-# ── 8. config.json ever committed ────────────────────────────────────────────
+# ── 7. config.json ever committed ────────────────────────────────────────────
 if [ -n "$(git log --all --format="%H" -- broker/config.json 2>/dev/null)" ]; then
     _fail "broker/config.json appears in git history — clean with git-filter-repo (see SECURITY-ROTATION.md)"
 else
     _pass "broker/config.json not in git history"
 fi
 
-# ── 9. .p8 files ever committed ──────────────────────────────────────────────
+# ── 8. .p8 files ever committed ──────────────────────────────────────────────
 if [ -n "$(git log --all --format="%H" -- '*.p8' 2>/dev/null)" ]; then
     _fail ".p8 file appears in git history"
 else
     _pass "No .p8 files in git history"
 fi
 
-# ── 10. Private key content in recent 50 commits ──────────────────────────────
+# ── 9. Private key content in recent 50 commits ───────────────────────────────
 RECENT_COMMITS=$(git log --all -50 --pretty="%H" 2>/dev/null)
 PRIVKEY_IN_HISTORY=0
 for commit in $RECENT_COMMITS; do

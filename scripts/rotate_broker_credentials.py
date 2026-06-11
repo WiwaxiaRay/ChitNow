@@ -28,11 +28,6 @@ _REPO              = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH        = os.path.join(_REPO, "broker", "config.json")
 RELAY_CREDS_PATH   = os.path.join(_REPO, "broker", "relay_credentials.json")
 
-KNOWN_LEAKED_KEYS = {
-    "REDACTED_BROKER_API_KEY",
-}
-
-
 def _current_key() -> str | None:
     try:
         return json.loads(open(CONFIG_PATH).read()).get("api_key")
@@ -107,17 +102,17 @@ def _revoke_relay_installation() -> None:
 def main():
     old_key = _current_key()
 
-    if old_key and old_key not in KNOWN_LEAKED_KEYS:
-        # Prompt — the key may still be fine (user may have already rotated manually)
+    if old_key:
         answer = input(
-            f"Current API key does not match known-leaked keys.\n"
-            f"Rotate anyway? [y/N]: "
+            "Rotate the current Broker API key? [y/N]: "
         ).strip().lower()
         if answer not in ("y", "yes"):
             print("Rotation cancelled.")
             sys.exit(0)
 
     new_key = secrets.token_hex(32)
+    while new_key == old_key:
+        new_key = secrets.token_hex(32)
     _write_key(new_key)
     print(f"[rotate] New API key written to {CONFIG_PATH}")
 
@@ -141,9 +136,8 @@ def main():
     print("3. Clean git history to expunge the leaked key.")
     print("   See SECURITY-ROTATION.md for instructions.")
     print()
-    if old_key in KNOWN_LEAKED_KEYS:
-        print("WARNING: the old key was publicly exposed in git history.")
-        print("Treat it as fully compromised. Complete step 3 immediately.")
+    if old_key:
+        print("WARNING: treat the previous key as compromised if it was ever committed or shared.")
     print("=" * 60)
 
 

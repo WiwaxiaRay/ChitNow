@@ -18,7 +18,7 @@ REPO = Path(__file__).parent.parent.parent
 SCRIPTS = REPO / "scripts"
 BROKER = REPO / "broker"
 
-KNOWN_LEAKED_KEY = "REDACTED_BROKER_API_KEY"
+EXAMPLE_OLD_KEY = "a" * 64
 
 
 # ---------------------------------------------------------------------------
@@ -41,13 +41,15 @@ def _load_rotate():
 
 class TestRotateBrokerCredentials:
     def test_new_key_differs_from_old(self, tmp_path):
-        """Rotation must produce a key different from the leaked one."""
+        """Rotation must produce a key different from the current one."""
         mod = _load_rotate()
-        old = KNOWN_LEAKED_KEY
-        new_key = mod._write_key.__module__  # ensure module loaded
-        new_key = __import__("secrets").token_hex(32)
-        assert new_key != old
-        assert len(new_key) == 64  # 32 bytes hex
+        new_key = "b" * 64
+        with patch.object(mod, "_current_key", return_value=EXAMPLE_OLD_KEY), \
+             patch.object(mod, "_write_key") as write_key, \
+             patch.object(mod.secrets, "token_hex", side_effect=[EXAMPLE_OLD_KEY, new_key]), \
+             patch("builtins.input", return_value="y"):
+            mod.main()
+        write_key.assert_called_once_with(new_key)
 
     def test_write_key_creates_600_file(self, tmp_path):
         """rotate script writes config.json with mode 600."""
@@ -66,17 +68,17 @@ class TestRotateBrokerCredentials:
         finally:
             mod.CONFIG_PATH = orig
 
-    def test_known_leaked_key_constant(self):
-        """KNOWN_LEAKED_KEYS must include the historically committed key."""
+    def test_no_historical_key_allowlist(self):
+        """Rotation code must not preserve previously exposed key literals."""
         mod = _load_rotate()
-        assert KNOWN_LEAKED_KEY in mod.KNOWN_LEAKED_KEYS
+        assert not hasattr(mod, "KNOWN_LEAKED_KEYS")
 
     def test_rotate_preserves_relay_url(self, tmp_path):
         """Rotating credentials must preserve relay_url in config.json."""
         mod = _load_rotate()
         cfg_path = tmp_path / "config.json"
         cfg_path.write_text(json.dumps({
-            "api_key": KNOWN_LEAKED_KEY,
+            "api_key": EXAMPLE_OLD_KEY,
             "relay_url": "https://relay.example.com",
         }))
         orig = mod.CONFIG_PATH
@@ -148,18 +150,6 @@ class TestScanSecrets:
         assert scan.exists(), "scripts/scan_secrets.sh must exist"
         assert os.access(str(scan), os.X_OK), "scan_secrets.sh must be executable"
 
-    def test_scan_detects_leaked_key_in_file(self, tmp_path):
-        """scan_secrets.sh should detect the known leaked key in a file."""
-        # Write the leaked key into a tmp file, then verify scan would catch it
-        # (We can't modify the real working tree, so just verify the grep pattern works)
-        test_file = tmp_path / "test.json"
-        test_file.write_text(json.dumps({"api_key": KNOWN_LEAKED_KEY}))
-        result = subprocess.run(
-            ["grep", "-l", KNOWN_LEAKED_KEY, str(test_file)],
-            capture_output=True, text=True
-        )
-        assert result.returncode == 0, "grep must find the leaked key"
-
     def test_scan_runs_in_repo(self):
         """scan_secrets.sh runs without crashing (exit 0 or 1 both acceptable)."""
         result = subprocess.run(
@@ -177,8 +167,7 @@ class TestScanSecrets:
     def test_scan_no_false_positive_on_test_files(self):
         """scan_secrets.sh must not flag broker/tests/ files as secret leaks.
 
-        These files legitimately reference the leaked key string for testing;
-        the scanner's exclusion list must cover them.
+        Security tests use only synthetic keys and must not be reported as leaks.
         """
         result = subprocess.run(
             ["bash", str(SCRIPTS / "scan_secrets.sh")],
