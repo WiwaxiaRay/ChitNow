@@ -220,6 +220,22 @@ describe("GET /v1/challenge", () => {
     expect(typeof body.expires_at).toBe("number");
     expect((body.expires_at as number)).toBeGreaterThan(nowSecs());
   });
+
+  it("rate limits challenge creation per IP", async () => {
+    const headers = { "cf-connecting-ip": "203.0.113.10" };
+    for (let i = 0; i < 10; i++) {
+      const resp = await workerModule.fetch(
+        new Request("https://relay.example.com/v1/challenge", { headers }),
+        env,
+      );
+      expect(resp.status).toBe(200);
+    }
+    const limited = await workerModule.fetch(
+      new Request("https://relay.example.com/v1/challenge", { headers }),
+      env,
+    );
+    expect(limited.status).toBe(429);
+  });
 });
 
 describe("POST /v1/register", () => {
@@ -302,6 +318,40 @@ describe("POST /v1/register", () => {
     );
     expect(resp.status).toBe(410);
   });
+
+  it("rejects malformed APNs device tokens without consuming the challenge", async () => {
+    const chalResp = await workerModule.fetch(new Request("https://relay.example.com/v1/challenge"), env);
+    const chalJSON = await chalResp.json() as { challenge_id: string; nonce: string };
+    const invalidBody = JSON.stringify({
+      apns_device_token: "not-a-token",
+      challenge_id: chalJSON.challenge_id,
+      nonce: chalJSON.nonce,
+    });
+    const invalid = await workerModule.fetch(
+      new Request("https://relay.example.com/v1/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: invalidBody,
+      }),
+      env,
+    );
+    expect(invalid.status).toBe(400);
+
+    const validBody = JSON.stringify({
+      apns_device_token: "a".repeat(64),
+      challenge_id: chalJSON.challenge_id,
+      nonce: chalJSON.nonce,
+    });
+    const valid = await workerModule.fetch(
+      new Request("https://relay.example.com/v1/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: validBody,
+      }),
+      env,
+    );
+    expect(valid.status).toBe(201);
+  });
 });
 
 describe("POST /v1/push", () => {
@@ -343,7 +393,7 @@ describe("POST /v1/push", () => {
     const { installationId, relaySecret } = await registerInstallation(env);
 
     const bodyText = JSON.stringify({ event: "approval_pending" });
-    const nonce = "same-nonce-reused-12345678";
+    const nonce = "a1".repeat(16);
     const headers = await buildAuthHeaders("POST", "/v1/push", bodyText, installationId, relaySecret, { nonce });
 
     // First request succeeds
@@ -387,6 +437,33 @@ describe("POST /v1/push", () => {
       env
     );
     expect(resp.status).toBe(401);
+  });
+
+  it("atomically rate limits pushes per installation", async () => {
+    const { installationId, relaySecret } = await registerInstallation(env);
+    const bodyText = JSON.stringify({ event: "approval_pending" });
+    for (let i = 0; i < 30; i++) {
+      const headers = await buildAuthHeaders("POST", "/v1/push", bodyText, installationId, relaySecret);
+      const resp = await workerModule.fetch(
+        new Request("https://relay.example.com/v1/push", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...headers },
+          body: bodyText,
+        }),
+        env,
+      );
+      expect(resp.status).toBe(200);
+    }
+    const headers = await buildAuthHeaders("POST", "/v1/push", bodyText, installationId, relaySecret);
+    const limited = await workerModule.fetch(
+      new Request("https://relay.example.com/v1/push", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers },
+        body: bodyText,
+      }),
+      env,
+    );
+    expect(limited.status).toBe(429);
   });
 });
 
@@ -516,7 +593,7 @@ describe("POST /v1/rotate-secret", () => {
     expect(pushResp.status).toBe(200);
   });
 
-  it("old V1 secret rejected after rotation to V2", async () => {
+  it("old V1 secret works during grace, then expires", async () => {
     const envV1 = makeMockEnv(db, { activeVersion: 1 });
     const envV2 = makeMockEnv(db, { activeVersion: 2 });
 
@@ -534,7 +611,7 @@ describe("POST /v1/rotate-secret", () => {
       envV2
     );
 
-    // Push with old V1 secret against V2 env — invalid_signature
+    // Push with old V1 secret still succeeds during the response-loss grace window.
     const pushBody = JSON.stringify({ event: "approval_pending" });
     const pushHeaders = await buildAuthHeaders("POST", "/v1/push", pushBody, installationId, v1Secret);
     const pushResp = await workerModule.fetch(
@@ -545,7 +622,58 @@ describe("POST /v1/rotate-secret", () => {
       }),
       envV2
     );
-    expect(pushResp.status).toBe(401);
+    expect(pushResp.status).toBe(200);
+
+    sqliteDb.prepare(
+      "UPDATE installations SET previous_key_expires_at=? WHERE installation_id=?",
+    ).run(nowSecs() - 1, installationId);
+    const expiredHeaders = await buildAuthHeaders("POST", "/v1/push", pushBody, installationId, v1Secret);
+    const expiredResp = await workerModule.fetch(
+      new Request("https://relay.example.com/v1/push", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...expiredHeaders },
+        body: pushBody,
+      }),
+      envV2
+    );
+    expect(expiredResp.status).toBe(401);
+  });
+
+  it("recovers the new secret when the first rotation response was lost", async () => {
+    const envV1 = makeMockEnv(db, { activeVersion: 1 });
+    const envV2 = makeMockEnv(db, { activeVersion: 2 });
+    const { installationId, relaySecret: v1Secret } = await registerInstallation(envV1);
+    const rotateBody = JSON.stringify({});
+
+    const firstHeaders = await buildAuthHeaders(
+      "POST", "/v1/rotate-secret", rotateBody, installationId, v1Secret,
+    );
+    const first = await workerModule.fetch(
+      new Request("https://relay.example.com/v1/rotate-secret", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...firstHeaders },
+        body: rotateBody,
+      }),
+      envV2,
+    );
+    expect(first.status).toBe(200);
+
+    // Simulate a client that never received/saved the first response.
+    const retryHeaders = await buildAuthHeaders(
+      "POST", "/v1/rotate-secret", rotateBody, installationId, v1Secret,
+    );
+    const retry = await workerModule.fetch(
+      new Request("https://relay.example.com/v1/rotate-secret", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...retryHeaders },
+        body: rotateBody,
+      }),
+      envV2,
+    );
+    expect(retry.status).toBe(200);
+    const recovered = await retry.json() as { relay_secret: string };
+    expect(recovered.relay_secret).toHaveLength(64);
+    expect(recovered.relay_secret).not.toBe(v1Secret);
   });
 
   it("returns 401 with wrong signature", async () => {

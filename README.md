@@ -43,11 +43,9 @@ To set the relay URL on first installation:
 CHITNOW_RELAY_URL=https://your-worker.workers.dev bash install.sh
 ```
 
-After installation, install the iPhone app via Xcode, then pair:
-
-```
-Open in browser on your Mac: https://localhost:8000/pair
-```
+After installation, install the iPhone app via Xcode, then open the setup-token
+pairing URL printed by `install.sh`. A plain `https://localhost:8000/pair`
+request is intentionally rejected.
 
 > Your browser will show a certificate warning — this is expected. The certificate is self-signed and generated locally on your Mac. Click **Advanced → Proceed to localhost** (Chrome) or **Show Details → visit this website** (Safari).
 
@@ -58,7 +56,7 @@ Scan the QR code in the ChitNow iPhone app to complete pairing.
 The Cloudflare relay sends a generic APNs wake-up push when a new approval request is created. It never contains the command or summary.
 
 1. Create a Cloudflare D1 database and Worker (see `relay/README.md`)
-2. Set `RELAY_MASTER_SECRET`, `APNS_PRIVATE_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID` as Wrangler secrets
+2. Set `RELAY_MASTER_SECRET_V1`, `APNS_PRIVATE_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID` as Wrangler secrets
 3. Apply the schema: `wrangler d1 execute chitnow-relay --file=relay/schema.sql`
 4. Deploy: `cd relay && npm run deploy`
 5. Set the relay URL in `broker/config.json`:
@@ -93,6 +91,9 @@ hooks = true
 ```bash
 bash uninstall.sh
 ```
+
+Use `bash uninstall.sh --purge-data` to also remove the local database, logs,
+broker API key, relay credentials, and generated TLS certificates.
 
 ## Architecture
 
@@ -130,21 +131,22 @@ No commands, summaries, broker URLs, API keys, or fingerprints pass through the 
 
 ## Broker API
 
-All endpoints except `/health` require `X-API-Key` header.
+Normal broker endpoints require `X-API-Key`. Pairing uses short-lived setup and
+pairing tokens instead.
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Liveness probe |
-| POST | `/register-device` | Store iPhone APNs token |
 | POST | `/approval-requests` | Create request, send push |
 | GET | `/wait/{id}` | SSE — blocks until decision or 180s |
 | POST | `/decision/{id}` | Record approve/deny |
 | GET | `/pending-requests` | List non-expired pending requests |
 | GET | `/usage` | Claude + GPT token/cost summary (requires codexbar) |
 | GET | `/broker-ip` | Returns current HTTPS broker URL |
-| GET | `/pair` | Pairing page (localhost only) |
+| GET | `/pair?setup_token=...` | Pairing page (localhost + setup token) |
 | GET | `/audit` | Last 100 audit entries |
 | POST | `/relay-credentials` | Update relay installation credentials |
+| DELETE | `/relay-credentials` | Remove relay installation credentials |
 
 ## Logs
 

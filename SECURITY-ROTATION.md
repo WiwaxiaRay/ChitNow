@@ -51,13 +51,16 @@ The leaked key is permanently in the git object store until history is rewritten
 # Install once
 pip install git-filter-repo
 
-# Replace the leaked key everywhere in history
-git filter-repo --replace-text <(echo \
-  "REDACTED_BROKER_API_KEY==>REDACTED_API_KEY")
+# Remove the local runtime config from every commit.
+git filter-repo --path broker/config.json --invert-paths
 
-# Force-push all branches
-git push --force-with-lease --all
-git push --force-with-lease --tags
+# Verify before pushing.
+bash scripts/scan_secrets.sh
+git log --all -- broker/config.json
+
+# Force-push each affected remote after coordinating with collaborators.
+git push --force-with-lease origin --all
+git push --force-with-lease origin --tags
 ```
 
 > **Do not run this automatically.** Run only after coordinating with all repo collaborators, and after the broker key has already been rotated.

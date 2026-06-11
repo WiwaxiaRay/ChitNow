@@ -1,7 +1,7 @@
 """
 Security tests for Phase 0:
   - Credential rotation (rotate_broker_credentials.py)
-  - Broker log sanitisation (no full device tokens / commands / API keys in logs)
+  - Broker log sanitisation (no full commands / API keys in logs)
   - scan_secrets.sh smoke test
 """
 import importlib.util
@@ -66,41 +66,6 @@ class TestRotateBrokerCredentials:
         finally:
             mod.CONFIG_PATH = orig
 
-    def test_clear_devices_returns_count(self, tmp_path):
-        """_clear_devices returns the number of deleted rows."""
-        import sqlite3
-        db_path = tmp_path / "broker.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("CREATE TABLE devices (id TEXT PRIMARY KEY, device_token TEXT NOT NULL, created_at TEXT)")
-        conn.execute("INSERT INTO devices VALUES ('default', 'token123', '2024-01-01')")
-        conn.commit()
-        conn.close()
-
-        mod = _load_rotate()
-        orig = mod.DB_PATH
-        mod.DB_PATH = str(db_path)
-        try:
-            count = mod._clear_devices()
-            assert count == 1
-            # Verify row is gone
-            conn2 = sqlite3.connect(str(db_path))
-            rows = conn2.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
-            conn2.close()
-            assert rows == 0
-        finally:
-            mod.DB_PATH = orig
-
-    def test_clear_devices_missing_db_returns_zero(self, tmp_path):
-        """_clear_devices must not raise when broker.db doesn't exist."""
-        mod = _load_rotate()
-        orig = mod.DB_PATH
-        mod.DB_PATH = str(tmp_path / "nonexistent.db")
-        try:
-            count = mod._clear_devices()
-            assert count == 0
-        finally:
-            mod.DB_PATH = orig
-
     def test_known_leaked_key_constant(self):
         """KNOWN_LEAKED_KEYS must include the historically committed key."""
         mod = _load_rotate()
@@ -138,7 +103,6 @@ class TestLogSanitisation:
         key = "test-log-sanitise-key"
         db_path = str(tmp_path / "test_log.db")
         monkeypatch.setenv("THENOW_API_KEY", key)
-        monkeypatch.setenv("THENOW_APNS_ENV", "sandbox")
         import sys as _sys
         for mod in list(_sys.modules.keys()):
             if mod == "main":
@@ -149,20 +113,6 @@ class TestLogSanitisation:
         asyncio.run(m.init_db())
         from fastapi.testclient import TestClient
         return TestClient(m.app), m, key
-
-    def test_register_device_truncates_token(self, monkeypatch, tmp_path, capsys):
-        """POST /register-device must not log the full device token."""
-        c, m, key = self._make_client(monkeypatch, tmp_path)
-        full_token = "a" * 64
-        c.post("/register-device",
-               headers={"X-API-Key": key},
-               json={"device_token": full_token})
-        captured = capsys.readouterr()
-        combined = captured.out + captured.err
-        # Full token must not appear in logs
-        assert full_token not in combined, "Full device token must not appear in log output"
-        # Truncated prefix IS expected
-        assert full_token[:12] in combined
 
     def test_create_request_truncates_summary(self, monkeypatch, tmp_path, capsys):
         """POST /approval-requests must truncate long summaries in logs."""

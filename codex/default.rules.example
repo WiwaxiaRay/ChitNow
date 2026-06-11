@@ -1,38 +1,93 @@
 # ChitNow — Codex PermissionRequest rule template
 #
-# These rules route matching shell commands into Codex's PermissionRequest
-# flow, where ChitNow intercepts them and sends an approval request to your
-# Apple Watch.
+# Copy relevant rules into ~/.codex/rules/default.rules, then re-trust hooks
+# in the Codex TUI (/hooks) or restart the Codex desktop app.
 #
-# INSTALL:
-#   Merge into ~/.codex/rules/default.rules (create if it doesn't exist).
-#   Then re-trust hooks in the Codex TUI: run /hooks and confirm.
+# FORMAT: prefix_rule() DSL — each rule routes commands whose argv STARTS WITH
+# the given pattern into Codex's PermissionRequest flow.  ChitNow intercepts
+# all PermissionRequest commands and sends them to your Apple Watch.
 #
-# FORMAT: one pattern per line (plain prefix match or glob).
-#   Lines starting with '#' are comments and are ignored.
-#   Each non-comment line is matched as a prefix against the full command string.
+# pattern: list of strings that must match successive argv tokens.
+#   A nested list at position N means "any of these values is acceptable".
+#   Example: [["git", "/usr/bin/git"], "push"] matches both
+#            `git push` and `/usr/bin/git push`.
 #
-# NOTE: ChitNow only receives commands that Codex routes here. Commands not
-# matched by these rules are executed directly without Watch approval.
+# LIMITATION: prefix matching cannot inspect arbitrary script contents. Rules
+# below conservatively prompt for opaque interpreters and git path overrides.
 
-# Privilege escalation
-sudo
+# ── Privilege escalation ────────────────────────────────────────────────────
+prefix_rule(
+    pattern=[["sudo", "/usr/bin/sudo"]],
+    decision="prompt",
+    justification="Require Apple Watch approval for privilege escalation",
+)
 
-# Destructive file operations
-rm -rf
-rm -r
+# ── Destructive file operations ─────────────────────────────────────────────
+prefix_rule(
+    pattern=[["rm", "/bin/rm"]],
+    decision="prompt",
+    justification="Require Apple Watch approval for file deletion",
+)
 
-# Force-push and history rewrite
-git push --force
-git push -f
-git reset --hard
-git clean -fd
-git clean -f
+# ── Git history rewrite / remote push ───────────────────────────────────────
+prefix_rule(
+    pattern=[["git", "/usr/bin/git", "/opt/homebrew/bin/git"], "push"],
+    decision="prompt",
+    justification="Require Apple Watch approval for git push",
+)
 
-# Remote script execution via pipe
-curl
-wget
+prefix_rule(
+    pattern=[["git", "/usr/bin/git", "/opt/homebrew/bin/git"], "reset", "--hard"],
+    decision="prompt",
+    justification="Require Apple Watch approval for git reset --hard",
+)
 
-# Overwrite system paths
-> /etc/
-> /usr/
+prefix_rule(
+    pattern=[["git", "/usr/bin/git", "/opt/homebrew/bin/git"], "clean"],
+    decision="prompt",
+    justification="Require Apple Watch approval for git clean",
+)
+
+# Prompt for git path overrides because the eventual subcommand appears after
+# an arbitrary path and cannot be expressed precisely with a prefix rule.
+prefix_rule(
+    pattern=[["git", "/usr/bin/git", "/opt/homebrew/bin/git"], "-C"],
+    decision="prompt",
+    justification="Require Apple Watch approval for git path override commands",
+)
+
+prefix_rule(
+    pattern=[["git", "/usr/bin/git", "/opt/homebrew/bin/git"], "--git-dir"],
+    decision="prompt",
+    justification="Require Apple Watch approval for git directory override commands",
+)
+
+prefix_rule(
+    pattern=[["git", "/usr/bin/git", "/opt/homebrew/bin/git"], "--work-tree"],
+    decision="prompt",
+    justification="Require Apple Watch approval for git work-tree override commands",
+)
+
+# ── Opaque shell / script execution ─────────────────────────────────────────
+prefix_rule(
+    pattern=[["bash", "/bin/bash", "/usr/bin/bash",
+              "sh", "/bin/sh", "/usr/bin/sh",
+              "zsh", "/bin/zsh", "/usr/bin/zsh"]],
+    decision="prompt",
+    justification="Require Apple Watch approval for shell execution",
+)
+
+prefix_rule(
+    pattern=[["python", "python3", "/usr/bin/python3", "/opt/homebrew/bin/python3",
+              "perl", "/usr/bin/perl",
+              "ruby", "/usr/bin/ruby",
+              "node", "/usr/bin/node", "/opt/homebrew/bin/node"]],
+    decision="prompt",
+    justification="Require Apple Watch approval for opaque script execution",
+)
+
+prefix_rule(
+    pattern=[["find", "/usr/bin/find", "xargs", "/usr/bin/xargs"]],
+    decision="prompt",
+    justification="Require Apple Watch approval for bulk file operations",
+)

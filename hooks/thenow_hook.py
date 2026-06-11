@@ -45,6 +45,7 @@ def _load_broker_config() -> tuple[str, str, str | None]:
         _candidates = [
             p for p in [os.environ.get("THENOW_CONFIG_PATH")] if p
         ] + [
+            os.path.normpath(os.path.join(os.path.dirname(sys.executable), "..", "..", "config.json")),
             os.path.normpath(os.path.join(_script_dir, "..", "broker", "config.json")),
             os.path.expanduser("~/chitnow/broker/config.json"),
             os.path.expanduser("~/thenow/broker/config.json"),
@@ -53,21 +54,34 @@ def _load_broker_config() -> tuple[str, str, str | None]:
         if cfg_path:
             try:
                 cfg   = json.loads(open(cfg_path).read())
-                url   = url  or "https://localhost:8000"
+                url   = url  or "https://127.0.0.1:8000"
                 key   = key  or cfg.get("api_key") or None
                 cert  = cert or os.path.join(os.path.dirname(cfg_path), "certs", "broker.crt")
             except Exception as e:
                 _log_debug(f"[config] parse error: {e}")
         else:
             _log_debug("[config] config.json not found in any candidate path")
-        url = url or "https://localhost:8000"
+        url = url or "https://127.0.0.1:8000"
     return url, key, cert
 
 BROKER_URL, API_KEY, CERT_PATH = _load_broker_config()
 TIMEOUT = 185  # slightly over broker's 180s
+APPROVAL_MODE = os.environ.get("THENOW_APPROVAL_MODE", "strict").lower()
+if APPROVAL_MODE not in ("strict", "balanced"):
+    APPROVAL_MODE = "strict"
 
 # API_KEY is None when config.json cannot be found or has no key.
 # main() checks this and denies rather than falling back to a default.
+
+# Additional patterns applied in balanced mode (stacked on top of HIGH_RISK_PATTERNS).
+BALANCED_EXTRA_PATTERNS = [
+    r"\bgit\b.*\b(?:push|reset|clean)\b",
+    r"\bfind\b.*(?:^|\s)-delete(?:\s|$)",
+    r"\b(?:bash|sh|zsh|ksh|fish)\s+-(?:c|lc)\b",
+    r"\b(?:bash|sh|zsh|ksh|fish)\s+\S+\.(?:sh|bash|zsh)\b",
+    r"\b(?:python(?:3(?:\.\d+)?)?|perl|ruby|node)\s+-(?:c|e)\b",
+    r"\b(?:xargs|eval|exec)\b",
+]
 
 HIGH_RISK_PATTERNS = [
     r"rm\s+-[rf]",
@@ -89,6 +103,15 @@ HIGH_RISK_PATTERNS = [
 
 def is_high_risk(command: str) -> bool:
     return any(re.search(p, command, re.IGNORECASE) for p in HIGH_RISK_PATTERNS)
+
+
+def _needs_watch(command: str, tool_name: str) -> bool:
+    """Return True if this PreToolUse command requires Watch approval."""
+    if APPROVAL_MODE == "strict":
+        return tool_name == "Bash"
+    # balanced: high-risk patterns plus extra detections
+    all_patterns = HIGH_RISK_PATTERNS + BALANCED_EXTRA_PATTERNS
+    return any(re.search(p, command, re.IGNORECASE) for p in all_patterns)
 
 
 def summarize(command: str) -> str:
@@ -231,7 +254,7 @@ def main():
     # Low-risk PreToolUse commands always pass through — no broker needed.
     if not command:
         _exit_passthrough()
-    if _hook_event_name != "PermissionRequest" and not is_high_risk(command):
+    if _hook_event_name != "PermissionRequest" and not _needs_watch(command, tool_name):
         _exit_passthrough()
 
     # Beyond here: high-risk command or PermissionRequest.
@@ -244,7 +267,11 @@ def main():
     summary = _description if _description else summarize(command)
     headers = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
 
-    verify: bool | str = CERT_PATH if CERT_PATH and os.path.exists(CERT_PATH) else False
+    if not (CERT_PATH and os.path.exists(CERT_PATH)):
+        print("[thenow] broker cert not found — denying", file=sys.stderr)
+        _exit_deny("broker cert not found — re-run install.sh to regenerate certs")
+        return
+    verify: str = CERT_PATH
 
     # Create approval request
     try:

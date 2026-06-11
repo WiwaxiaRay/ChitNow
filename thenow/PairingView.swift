@@ -97,7 +97,11 @@ struct PairingView: View {
             if let relayURL = payload.relay_url, !relayURL.isEmpty {
                 let deviceToken = await currentDeviceToken()
                 if let token = deviceToken {
-                    relayCreds = await RelayClient.registerOrUpdate(deviceToken: token, relayURL: relayURL)
+                    relayCreds = await RelayClient.registerOrUpdate(
+                        deviceToken: token,
+                        relayURL: relayURL,
+                        rotateExisting: true
+                    )
                 }
             }
 
@@ -105,6 +109,9 @@ struct PairingView: View {
             await MainActor.run {
                 confirming = false
                 if let resp {
+                    if let relayCreds {
+                        RelayClient.commit(credentials: relayCreds)
+                    }
                     KeychainHelper.save(
                         brokerURL:       resp.broker_url,
                         apiKey:          resp.api_key,

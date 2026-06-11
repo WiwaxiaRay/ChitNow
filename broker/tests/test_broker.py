@@ -38,6 +38,7 @@ def client(monkeypatch, tmp_path):
     import main as broker_main
     # Redirect DB to isolated temp path so tests never touch broker/broker.db
     monkeypatch.setattr(broker_main, "DB_PATH", db_path)
+    monkeypatch.setattr(broker_main, "PAIRING_BOOTSTRAP_SECRET", "test-setup-token")
     with TestClient(broker_main.app) as c:
         yield c, broker_main
 
@@ -45,6 +46,8 @@ def client(monkeypatch, tmp_path):
 GOOD_KEY = "test-key-abc123"
 BAD_KEY  = "wrong-key"
 HEADERS  = {"X-API-Key": GOOD_KEY}
+RELAY_ID = "123e4567-e89b-42d3-a456-426614174000"
+RELAY_SECRET = "a" * 64
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +137,52 @@ def test_pair_page_allowed_from_localhost(client):
             await self.app(scope, receive, send)
 
     with _TC(FakeLocalhostMiddleware(broker_main.app)) as tc:
-        r = tc.get("/pair")
+        r = tc.get("/pair?setup_token=test-setup-token")
     assert r.status_code == 200
+
+
+def test_pair_page_requires_setup_token(client):
+    c, _ = client
+    from starlette.testclient import TestClient as _TC
+    from starlette.types import ASGIApp, Receive, Scope, Send
+    import main as broker_main
+
+    class FakeLocalhostMiddleware:
+        def __init__(self, app: ASGIApp):
+            self.app = app
+        async def __call__(self, scope: Scope, receive: Receive, send: Send):
+            if scope["type"] == "http":
+                scope = dict(scope)
+                scope["client"] = ("127.0.0.1", 54321)
+            await self.app(scope, receive, send)
+
+    with _TC(FakeLocalhostMiddleware(broker_main.app)) as tc:
+        missing = tc.get("/pair")
+        wrong = tc.get("/pair?setup_token=wrong")
+    assert missing.status_code == 403
+    assert wrong.status_code == 403
+
+
+def test_pair_page_does_not_expose_setup_token_or_api_key(client):
+    c, _ = client
+    from starlette.testclient import TestClient as _TC
+    from starlette.types import ASGIApp, Receive, Scope, Send
+    import main as broker_main
+
+    class FakeLocalhostMiddleware:
+        def __init__(self, app: ASGIApp):
+            self.app = app
+        async def __call__(self, scope: Scope, receive: Receive, send: Send):
+            if scope["type"] == "http":
+                scope = dict(scope)
+                scope["client"] = ("127.0.0.1", 54321)
+            await self.app(scope, receive, send)
+
+    with _TC(FakeLocalhostMiddleware(broker_main.app)) as tc:
+        r = tc.get("/pair?setup_token=test-setup-token")
+    assert r.status_code == 200
+    assert "test-setup-token" not in r.text
+    assert GOOD_KEY not in r.text
 
 
 def test_pair_page_blocked_from_lan_ip(client):
@@ -166,7 +213,7 @@ def test_pair_page_blocked_from_lan_ip(client):
     from fastapi import FastAPI
     wrapped = FakeLanMiddleware(broker_main.app)
     with _TC(wrapped) as tc:
-        r = tc.get("/pair")
+        r = tc.get("/pair?setup_token=test-setup-token")
     assert r.status_code == 403
 
 
@@ -278,6 +325,25 @@ def test_create_request_without_relay_succeeds(client):
     assert r.status_code == 200
 
 
+def test_startup_removes_legacy_device_tokens(client):
+    """Relay-only broker must not retain the old direct-APNs token table."""
+    _, broker_main = client
+    import asyncio
+    import sqlite3
+
+    with sqlite3.connect(broker_main.DB_PATH) as db:
+        db.execute("CREATE TABLE devices (id TEXT PRIMARY KEY, device_token TEXT NOT NULL)")
+        db.execute("INSERT INTO devices VALUES ('default', ?)", ("a" * 64,))
+        db.commit()
+
+    asyncio.run(broker_main.init_db())
+    with sqlite3.connect(broker_main.DB_PATH) as db:
+        row = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='devices'"
+        ).fetchone()
+    assert row is None
+
+
 def test_relay_credentials_endpoint_without_relay_url(client):
     """POST /relay-credentials must return 400 when broker has no relay_url configured."""
     c, broker_main = client
@@ -317,8 +383,8 @@ def test_pair_confirm_ignores_relay_url_from_body(client, monkeypatch, tmp_path)
     }
     r = c.post(f"/pair/{sid}/confirm",
                headers={"X-Pairing-Token": pt},
-               json={"installation_id": "inst-123",
-                     "relay_secret": "secret-abc"})
+               json={"installation_id": RELAY_ID,
+                     "relay_secret": RELAY_SECRET})
     assert r.status_code == 200
     # save_credentials must NOT have been called (RELAY_URL is empty)
     assert len(saved_calls) == 0, "save_credentials must not be called when RELAY_URL is empty"
@@ -348,13 +414,13 @@ def test_relay_credentials_saved_from_config_relay_url(client, monkeypatch, tmp_
     }
     r = c.post(f"/pair/{sid}/confirm",
                headers={"X-Pairing-Token": pt},
-               json={"installation_id": "inst-from-body",
-                     "relay_secret": "secret-from-body"})
+               json={"installation_id": RELAY_ID,
+                     "relay_secret": RELAY_SECRET})
     assert r.status_code == 200
     assert len(saved_calls) == 1
     # URL must come from broker config, not body
     assert saved_calls[0]["relay_url"] == "https://relay.example.com"
-    assert saved_calls[0]["id"] == "inst-from-body"
+    assert saved_calls[0]["id"] == RELAY_ID
 
 
 def test_relay_credentials_endpoint_with_relay_url_configured(client, monkeypatch, tmp_path):
@@ -367,11 +433,32 @@ def test_relay_credentials_endpoint_with_relay_url_configured(client, monkeypatc
                         lambda url, iid, sec: saved.append(url))
 
     r = c.post("/relay-credentials", headers=HEADERS, json={
-        "installation_id": "inst-test",
-        "relay_secret": "sec-test",
+        "installation_id": RELAY_ID,
+        "relay_secret": RELAY_SECRET,
     })
     assert r.status_code == 200
     assert saved == ["https://relay.example.com"]
+
+
+def test_relay_credentials_endpoint_rejects_invalid_credentials(client, monkeypatch):
+    c, broker_main = client
+    monkeypatch.setattr(broker_main, "RELAY_URL", "https://relay.example.com")
+    r = c.post("/relay-credentials", headers=HEADERS, json={
+        "installation_id": "not-a-uuid",
+        "relay_secret": "not-a-secret",
+    })
+    assert r.status_code == 400
+
+
+def test_delete_relay_credentials_requires_auth_and_deletes(client, monkeypatch):
+    c, broker_main = client
+    deleted = []
+    monkeypatch.setattr(broker_main.relay_client, "delete_credentials",
+                        lambda: deleted.append(True))
+
+    assert c.delete("/relay-credentials").status_code == 401
+    assert c.delete("/relay-credentials", headers=HEADERS).status_code == 200
+    assert deleted == [True]
 
 
 # ---------------------------------------------------------------------------
@@ -559,13 +646,13 @@ def _no_config_env(tmp_path_str: str) -> dict:
 
 
 def test_hook_low_risk_without_config_allows(tmp_path):
-    """Hook with no config, low-risk command ls -la → exit 0 (passthrough)."""
+    """Balanced mode with no config, low-risk command ls -la → passthrough."""
     import sys as _sys
     r = _run_hook(
         {"hook_event_name": "PreToolUse", "tool_name": "Bash",
          "tool_input": {"command": "ls -la"}, "cwd": "/tmp",
          "transcript_path": "/home/.claude/t.json"},
-        _no_config_env(str(tmp_path))
+        {**_no_config_env(str(tmp_path)), "THENOW_APPROVAL_MODE": "balanced"}
     )
     assert r.returncode == 0, f"expected exit 0, got {r.returncode}\nstderr: {r.stderr}"
 
@@ -583,7 +670,7 @@ def test_hook_high_risk_without_config_denies(tmp_path):
 
 
 def test_hook_low_risk_with_config_allows(tmp_path):
-    """Hook with valid config, low-risk echo → exit 0."""
+    """Balanced mode with valid config, low-risk echo → exit 0."""
     import sys as _sys
     cfg_path = str(tmp_path / "config.json")
     with open(cfg_path, "w") as f:
@@ -596,6 +683,7 @@ def test_hook_low_risk_with_config_allows(tmp_path):
             "THENOW_CONFIG_PATH": cfg_path,
             "THENOW_BROKER_URL": "https://127.0.0.1:19999",
             "THENOW_API_KEY": "",
+            "THENOW_APPROVAL_MODE": "balanced",
         }
     )
     assert r.returncode == 0, f"expected exit 0, got {r.returncode}\nstderr: {r.stderr}"

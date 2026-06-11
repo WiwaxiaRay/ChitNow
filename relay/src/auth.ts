@@ -106,12 +106,14 @@ export function parseAuthHeaders(req: Request): AuthHeaders | null {
   const signature      = req.headers.get("X-ChitNow-Signature");
 
   if (!installationId || !timestampStr || !nonce || !signature) return null;
-  if (installationId.length < 1) return null;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(installationId)) {
+    return null;
+  }
 
   const timestamp = Number(timestampStr);
   if (!Number.isInteger(timestamp) || timestamp <= 0) return null;
 
-  if (nonce.length < 16 || nonce.length > 256) return null;
+  if (nonce.length < 16 || nonce.length > 256 || !/^[0-9a-f]+$/i.test(nonce)) return null;
   if (signature.length !== 64 || !/^[0-9a-f]+$/.test(signature)) return null;
 
   return { installationId, timestamp, nonce, signature };

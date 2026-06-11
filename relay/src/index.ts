@@ -35,6 +35,11 @@ const PUSH_RATE_WINDOW_SEC = 3600; // 1 hour window
 // Registration: max installations per IP to prevent abuse
 const REG_RATE_LIMIT_PER_IP  = 5;
 const REG_RATE_WINDOW_SEC    = 3600;
+const CHALLENGE_RATE_LIMIT_PER_IP = 10;
+const CHALLENGE_RATE_WINDOW_SEC   = 3600;
+const ROTATION_GRACE_SEC          = 60 * 60;
+
+const APNS_TOKEN_RE = /^[0-9a-f]{64}$/i;
 
 export interface Env {
   DB: D1Database;
@@ -83,6 +88,25 @@ function apnsConfig(env: Env): ApnsConfig {
   };
 }
 
+/** Atomically consume one fixed-window rate-limit slot. */
+async function consumeRateLimit(
+  env: Env,
+  scope: string,
+  subject: string,
+  limit: number,
+  windowSec: number,
+): Promise<boolean> {
+  const now = nowSecs();
+  const windowStart = now - (now % windowSec);
+  const result = await env.DB.prepare(
+    `INSERT INTO rate_limits (scope, subject, window_start, count)
+     VALUES (?, ?, ?, 1)
+     ON CONFLICT(scope, subject, window_start)
+     DO UPDATE SET count=count+1 WHERE count < ?`,
+  ).bind(scope, subject, windowStart, limit).run();
+  return result.meta.changes > 0;
+}
+
 // ── GET /health ───────────────────────────────────────────────────────────────
 
 async function handleHealth(env: Env): Promise<Response> {
@@ -93,7 +117,14 @@ async function handleHealth(env: Env): Promise<Response> {
 // ── GET /v1/challenge ─────────────────────────────────────────────────────────
 // Issues a one-time registration challenge. Required before registering.
 
-async function handleChallenge(_req: Request, env: Env): Promise<Response> {
+async function handleChallenge(req: Request, env: Env): Promise<Response> {
+  const ip = req.headers.get("cf-connecting-ip") ?? "unknown";
+  if (!await consumeRateLimit(
+    env, "challenge", ip, CHALLENGE_RATE_LIMIT_PER_IP, CHALLENGE_RATE_WINDOW_SEC
+  )) {
+    return json({ error: "rate_limited" }, 429);
+  }
+
   const challengeId = crypto.randomUUID();
   const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)))
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -117,15 +148,6 @@ async function handleChallenge(_req: Request, env: Env): Promise<Response> {
 async function handleRegister(req: Request, env: Env): Promise<Response> {
   const ip = req.headers.get("cf-connecting-ip") ?? "unknown";
 
-  // Basic IP-based rate limiting
-  const windowStart = nowSecs() - REG_RATE_WINDOW_SEC;
-  const recentRegs = await env.DB.prepare(
-    "SELECT COUNT(*) as cnt FROM push_log WHERE installation_id=? AND pushed_at > ?",
-  ).bind(`_reg_${ip}`, windowStart).first<{ cnt: number }>();
-  if ((recentRegs?.cnt ?? 0) >= REG_RATE_LIMIT_PER_IP) {
-    return json({ error: "rate_limited" }, 429);
-  }
-
   let body: unknown;
   try {
     body = await req.json();
@@ -141,13 +163,13 @@ async function handleRegister(req: Request, env: Env): Promise<Response> {
   const challengeId = b.challenge_id;
   const nonce       = b.nonce;
 
-  if (typeof apnsToken !== "string" || apnsToken.length < 32) {
-    return json({ error: "missing apns_device_token" }, 400);
+  if (typeof apnsToken !== "string" || !APNS_TOKEN_RE.test(apnsToken)) {
+    return json({ error: "invalid_apns_device_token" }, 400);
   }
-  if (typeof challengeId !== "string") {
+  if (typeof challengeId !== "string" || challengeId.length > 64) {
     return json({ error: "missing challenge_id" }, 400);
   }
-  if (typeof nonce !== "string") {
+  if (typeof nonce !== "string" || nonce.length > 128) {
     return json({ error: "missing nonce" }, 400);
   }
 
@@ -164,12 +186,10 @@ async function handleRegister(req: Request, env: Env): Promise<Response> {
     return json({ error: "invalid_nonce" }, 403);
   }
 
-  // Atomically mark challenge as used (prevents TOCTOU)
-  const updateResult = await env.DB.prepare(
-    "UPDATE reg_challenges SET used=1 WHERE challenge_id=? AND used=0"
-  ).bind(challengeId).run();
-  if (updateResult.meta.changes === 0) {
-    return json({ error: "challenge_already_used" }, 409);
+  if (!await consumeRateLimit(
+    env, "register", ip, REG_RATE_LIMIT_PER_IP, REG_RATE_WINDOW_SEC
+  )) {
+    return json({ error: "rate_limited" }, 429);
   }
 
   // Derive relay_secret using the active key version
@@ -182,14 +202,33 @@ async function handleRegister(req: Request, env: Env): Promise<Response> {
   const secretHash     = await sha256Hex(relaySecret);
   const now = nowSecs();
 
-  await env.DB.prepare(
-    `INSERT INTO installations (installation_id, relay_secret_hash, apns_device_token, created_at, last_seen_at, key_version)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).bind(installationId, secretHash, apnsToken, now, now, keyVersion).run();
-
-  // Track this registration for rate limiting
-  await env.DB.prepare("INSERT INTO push_log (installation_id, pushed_at) VALUES (?,?)")
-    .bind(`_reg_${ip}`, now).run();
+  // Claim the challenge in the same INSERT that creates the installation.
+  // registration_challenge_id is UNIQUE, so concurrent replays cannot create
+  // two installations even before the used flag is updated.
+  let insertResult;
+  try {
+    insertResult = await env.DB.prepare(
+      `INSERT INTO installations
+       (installation_id, relay_secret_hash, apns_device_token, created_at, last_seen_at,
+        key_version, registration_challenge_id)
+       SELECT ?, ?, ?, ?, ?, ?, challenge_id
+       FROM reg_challenges
+       WHERE challenge_id=? AND used=0 AND created_at >= ?`,
+    ).bind(
+      installationId, secretHash, apnsToken.toLowerCase(), now, now, keyVersion,
+      challengeId, now - 300,
+    ).run();
+  } catch (err) {
+    if (err instanceof Error && /unique|constraint/i.test(err.message)) {
+      return json({ error: "challenge_already_used" }, 409);
+    }
+    throw err;
+  }
+  if (insertResult.meta.changes === 0) {
+    return json({ error: "challenge_already_used" }, 409);
+  }
+  await env.DB.prepare("UPDATE reg_challenges SET used=1 WHERE challenge_id=?")
+    .bind(challengeId).run();
 
   return json({ installation_id: installationId, relay_secret: relaySecret }, 201);
 }
@@ -220,18 +259,39 @@ async function verifyAuth(
 
   // 2. Load installation (key_version determines which master secret to use)
   const inst = await env.DB.prepare(
-    "SELECT revoked_at, key_version FROM installations WHERE installation_id=?",
-  ).bind(authHeaders.installationId).first<{ revoked_at: number | null; key_version: number }>();
+    `SELECT revoked_at, key_version, previous_key_version, previous_key_expires_at
+     FROM installations WHERE installation_id=?`,
+  ).bind(authHeaders.installationId).first<{
+    revoked_at: number | null;
+    key_version: number;
+    previous_key_version: number | null;
+    previous_key_expires_at: number | null;
+  }>();
   if (!inst) return "installation_not_found";
   if (inst.revoked_at !== null) return "installation_revoked";
 
-  // 3. Verify HMAC — derive relay_secret using the installation's key_version
-  const masterSecret = getMasterSecret(env, inst.key_version ?? 1);
-  if (!masterSecret) return "invalid_signature"; // version key not in env
-  const relaySecret = await deriveRelaySecret(masterSecret, authHeaders.installationId);
+  // 3. Verify HMAC using the current key, then the temporary previous key.
   const canonical   = await canonicalMessage(method, path, authHeaders.timestamp, authHeaders.nonce, bodyText);
-  const expected    = await hmacSha256Hex(relaySecret, canonical);
-  if (!safeEqual(expected, authHeaders.signature)) return "invalid_signature";
+  const versions = [inst.key_version ?? 1];
+  if (
+    inst.previous_key_version !== null
+    && inst.previous_key_expires_at !== null
+    && inst.previous_key_expires_at >= nowSecs()
+  ) {
+    versions.push(inst.previous_key_version);
+  }
+  let signatureValid = false;
+  for (const version of versions) {
+    const masterSecret = getMasterSecret(env, version);
+    if (!masterSecret) continue;
+    const relaySecret = await deriveRelaySecret(masterSecret, authHeaders.installationId);
+    const expected = await hmacSha256Hex(relaySecret, canonical);
+    if (safeEqual(expected, authHeaders.signature)) {
+      signatureValid = true;
+      break;
+    }
+  }
+  if (!signatureValid) return "invalid_signature";
 
   // 4. Atomically insert nonce (throw on PRIMARY KEY violation = replayed)
   try {
@@ -259,12 +319,10 @@ async function handlePush(req: Request, env: Env): Promise<Response> {
     return json({ error: authErr }, status);
   }
 
-  // Verify rate limit for this installation
-  const windowStart = nowSecs() - PUSH_RATE_WINDOW_SEC;
-  const pushCount = await env.DB.prepare(
-    "SELECT COUNT(*) as cnt FROM push_log WHERE installation_id=? AND pushed_at > ?",
-  ).bind(authHeaders.installationId, windowStart).first<{ cnt: number }>();
-  if ((pushCount?.cnt ?? 0) >= PUSH_RATE_LIMIT) {
+  // Atomically consume one push slot for this installation.
+  if (!await consumeRateLimit(
+    env, "push", authHeaders.installationId, PUSH_RATE_LIMIT, PUSH_RATE_WINDOW_SEC
+  )) {
     return json({ error: "rate_limited" }, 429);
   }
 
@@ -290,6 +348,8 @@ async function handlePush(req: Request, env: Env): Promise<Response> {
     await env.DB.prepare("DELETE FROM used_nonces WHERE used_at < ?")
       .bind(cleanupBefore - 900).run();
     await env.DB.prepare("DELETE FROM push_log WHERE pushed_at < ?")
+      .bind(cleanupBefore - 7200).run();
+    await env.DB.prepare("DELETE FROM rate_limits WHERE window_start < ?")
       .bind(cleanupBefore - 7200).run();
   } catch {
     // cleanup failure must never fail a push request
@@ -334,13 +394,13 @@ async function handleUpdateToken(req: Request, env: Env): Promise<Response> {
   }
 
   const apnsToken = b.apns_device_token;
-  if (typeof apnsToken !== "string" || apnsToken.length < 32) {
-    return json({ error: "missing apns_device_token" }, 400);
+  if (typeof apnsToken !== "string" || !APNS_TOKEN_RE.test(apnsToken)) {
+    return json({ error: "invalid_apns_device_token" }, 400);
   }
 
   await env.DB.prepare(
     "UPDATE installations SET apns_device_token=?, last_seen_at=?, token_stale_at=NULL WHERE installation_id=?",
-  ).bind(apnsToken, nowSecs(), authHeaders.installationId).run();
+  ).bind(apnsToken.toLowerCase(), nowSecs(), authHeaders.installationId).run();
 
   return json({ status: "ok" });
 }
@@ -373,8 +433,8 @@ async function handleRevoke(req: Request, env: Env): Promise<Response> {
 //
 // Client flow:
 //   1. Send request signed with current relay_secret.
-//   2. Save returned relay_secret to Keychain (replaces old secret).
-//   3. Send new relay_secret to Mac Broker via TLS-pinned LAN.
+//   2. Send new relay_secret to Mac Broker via TLS-pinned LAN.
+//   3. Save returned relay_secret to Keychain after Broker confirms receipt.
 //   Broker saves to relay_credentials.json (600).
 
 async function handleRotateSecret(req: Request, env: Env): Promise<Response> {
@@ -392,12 +452,26 @@ async function handleRotateSecret(req: Request, env: Env): Promise<Response> {
   if (!newMasterSecret) return json({ error: "key_version_unavailable" }, 503);
 
   const newRelaySecret = await deriveRelaySecret(newMasterSecret, authHeaders.installationId);
+  const newSecretHash = await sha256Hex(newRelaySecret);
+  const inst = await env.DB.prepare(
+    "SELECT key_version FROM installations WHERE installation_id=?",
+  ).bind(authHeaders.installationId).first<{ key_version: number }>();
+  if (!inst) return json({ error: "installation_not_found" }, 404);
 
-  await env.DB.prepare(
-    "UPDATE installations SET key_version=?, last_seen_at=? WHERE installation_id=?",
-  ).bind(newVersion, nowSecs(), authHeaders.installationId).run();
+  if (inst.key_version !== newVersion) {
+    const now = nowSecs();
+    await env.DB.prepare(
+      `UPDATE installations
+       SET previous_key_version=key_version, previous_key_expires_at=?,
+           key_version=?, relay_secret_hash=?, last_seen_at=?
+       WHERE installation_id=? AND key_version=?`,
+    ).bind(
+      now + ROTATION_GRACE_SEC, newVersion, newSecretHash, now,
+      authHeaders.installationId, inst.key_version,
+    ).run();
+  }
 
-  return json({ relay_secret: newRelaySecret });
+  return json({ relay_secret: newRelaySecret, grace_period_seconds: ROTATION_GRACE_SEC });
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────

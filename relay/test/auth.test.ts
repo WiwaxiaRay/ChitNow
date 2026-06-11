@@ -134,7 +134,7 @@ describe("parseAuthHeaders", () => {
     new Request("https://example.com/v1/push", { method: "POST", headers });
 
   const validHeaders = {
-    "X-ChitNow-Installation": "inst-abc-123",
+    "X-ChitNow-Installation": "123e4567-e89b-42d3-a456-426614174000",
     "X-ChitNow-Timestamp":    "1700000000",
     "X-ChitNow-Nonce":        "a".repeat(16),
     "X-ChitNow-Signature":    "a".repeat(64),
@@ -143,7 +143,7 @@ describe("parseAuthHeaders", () => {
   it("parses valid headers", () => {
     const result = parseAuthHeaders(makeReq(validHeaders));
     expect(result).not.toBeNull();
-    expect(result!.installationId).toBe("inst-abc-123");
+    expect(result!.installationId).toBe("123e4567-e89b-42d3-a456-426614174000");
     expect(result!.timestamp).toBe(1700000000);
     expect(result!.nonce).toBe("a".repeat(16));
     expect(result!.signature).toBe("a".repeat(64));
@@ -152,6 +152,13 @@ describe("parseAuthHeaders", () => {
   it("returns null if X-ChitNow-Installation missing", () => {
     const { "X-ChitNow-Installation": _, ...rest } = validHeaders;
     expect(parseAuthHeaders(makeReq(rest))).toBeNull();
+  });
+
+  it("returns null if installation id is not a UUID", () => {
+    expect(parseAuthHeaders(makeReq({
+      ...validHeaders,
+      "X-ChitNow-Installation": "not-a-uuid",
+    }))).toBeNull();
   });
 
   it("returns null if X-ChitNow-Timestamp missing", () => {
@@ -175,6 +182,13 @@ describe("parseAuthHeaders", () => {
 
   it("returns null if nonce is too short", () => {
     expect(parseAuthHeaders(makeReq({ ...validHeaders, "X-ChitNow-Nonce": "short" }))).toBeNull();
+  });
+
+  it("returns null if nonce is not hex", () => {
+    expect(parseAuthHeaders(makeReq({
+      ...validHeaders,
+      "X-ChitNow-Nonce": "z".repeat(16),
+    }))).toBeNull();
   });
 
   it("returns null if signature is not 64 hex chars", () => {

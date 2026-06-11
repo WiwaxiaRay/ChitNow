@@ -5,12 +5,10 @@ Rotate broker API key after a credential leak.
 What this script does:
   1. Generates a new random 64-hex-char API key.
   2. Writes it to broker/config.json (600), preserving other fields (relay_url).
-  3. Clears the devices table so stale device tokens (registered under the
-     old key) are removed — all paired clients must re-register.
-  4. Preserves TLS certs so re-pairing only requires scanning the QR again,
+  3. Preserves TLS certs so re-pairing only requires scanning the QR again,
      not accepting a new certificate warning.
-  5. Best-effort revokes relay installation and removes relay_credentials.json.
-  6. Prints a re-pair reminder.
+  4. Best-effort revokes relay installation and removes relay_credentials.json.
+  5. Prints a re-pair reminder.
 
 What this script does NOT do:
   - Clean git history (see SECURITY-ROTATION.md).
@@ -24,12 +22,10 @@ Usage:
 import json
 import os
 import secrets
-import sqlite3
 import sys
 
 _REPO              = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH        = os.path.join(_REPO, "broker", "config.json")
-DB_PATH            = os.path.join(_REPO, "broker", "broker.db")
 RELAY_CREDS_PATH   = os.path.join(_REPO, "broker", "relay_credentials.json")
 
 KNOWN_LEAKED_KEYS = {
@@ -55,21 +51,6 @@ def _write_key(new_key: str) -> None:
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
     os.chmod(CONFIG_PATH, 0o600)
-
-
-def _clear_devices() -> int:
-    if not os.path.exists(DB_PATH):
-        return 0
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute("DELETE FROM devices")
-        count = cur.rowcount
-        conn.commit()
-        conn.close()
-        return count
-    except Exception as e:
-        print(f"  warning: could not clear devices table: {e}", file=sys.stderr)
-        return 0
 
 
 def _revoke_relay_installation() -> None:
@@ -140,10 +121,6 @@ def main():
     _write_key(new_key)
     print(f"[rotate] New API key written to {CONFIG_PATH}")
 
-    cleared = _clear_devices()
-    if cleared:
-        print(f"[rotate] Cleared {cleared} device registration(s) from broker.db")
-
     # Best-effort relay revocation (non-fatal)
     if os.path.exists(RELAY_CREDS_PATH):
         print("[rotate] Revoking relay installation...")
@@ -158,7 +135,7 @@ def main():
     print("   launchctl load  ~/Library/LaunchAgents/com.wangyang.thenow-broker.plist")
     print()
     print("2. Re-pair all clients:")
-    print("   Open https://localhost:8000/pair in your Mac browser.")
+    print("   Re-run bash install.sh and open the setup-token pairing URL it prints.")
     print("   Scan the QR code in the ChitNow iPhone app.")
     print()
     print("3. Clean git history to expunge the leaked key.")

@@ -97,13 +97,18 @@ enum BrokerClient {
         return items.compactMap { $0["id"] as? String }
     }
 
-    static func registerDevice(token: String) async {
-        await post(path: "/register-device", body: ["device_token": token])
+    static func sendRelayCredentials(installationId: String, secret: String) async -> Bool {
+        await postForStatus(path: "/relay-credentials",
+                            body: ["installation_id": installationId, "relay_secret": secret])
     }
 
-    static func sendRelayCredentials(installationId: String, secret: String) async {
-        await post(path: "/relay-credentials",
-                   body: ["installation_id": installationId, "relay_secret": secret])
+    static func deleteRelayCredentials() async {
+        guard isPaired, let url = URL(string: "\(brokerURL)/relay-credentials") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        req.timeoutInterval = 10
+        _ = try? await makeSession().data(for: req)
     }
 
     static func postDecision(requestId: String, decision: String) async {
@@ -131,12 +136,19 @@ enum BrokerClient {
     }
 
     private static func post(path: String, body: [String: String]) async {
-        guard let url = URL(string: "\(brokerURL)\(path)") else { return }
+        _ = await postForStatus(path: path, body: body)
+    }
+
+    private static func postForStatus(path: String, body: [String: String]) async -> Bool {
+        guard let url = URL(string: "\(brokerURL)\(path)") else { return false }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
         req.httpBody = try? JSONEncoder().encode(body)
-        _ = try? await makeSession().data(for: req)
+        guard let (_, resp) = try? await makeSession().data(for: req),
+              let http = resp as? HTTPURLResponse
+        else { return false }
+        return (200..<300).contains(http.statusCode)
     }
 }

@@ -96,8 +96,9 @@ class TestClaudePreToolUseExitCodes:
         )
 
     def test_low_risk_exit0(self, tmp_path):
-        """Claude low-risk command → exit 0 (passthrough)."""
-        r = _run(_claude_preuse("ls -la"), _no_config_env(tmp_path))
+        """Claude low-risk command in balanced mode → exit 0 (passthrough)."""
+        env = {**_no_config_env(tmp_path), "THENOW_APPROVAL_MODE": "balanced"}
+        r = _run(_claude_preuse("ls -la"), env)
         assert r.returncode == 0, (
             f"expected exit 0 (allow), got {r.returncode}"
         )
@@ -123,8 +124,9 @@ class TestCodexPreToolUseExitCodes:
         assert r.returncode == 2
 
     def test_low_risk_exit0(self, tmp_path):
-        """Codex PreToolUse low-risk → exit 0."""
-        r = _run(_codex_preuse("echo hello"), _no_config_env(tmp_path))
+        """Codex PreToolUse low-risk in balanced mode → exit 0."""
+        env = {**_no_config_env(tmp_path), "THENOW_APPROVAL_MODE": "balanced"}
+        r = _run(_codex_preuse("echo hello"), env)
         assert r.returncode == 0
 
 

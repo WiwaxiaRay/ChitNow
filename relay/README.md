@@ -28,7 +28,7 @@ wrangler d1 execute chitnow-relay --file=schema.sql
 ### 2. Set Worker Secrets
 
 ```bash
-wrangler secret put RELAY_MASTER_SECRET  # random secret, e.g. openssl rand -hex 32
+wrangler secret put RELAY_MASTER_SECRET_V1  # random secret, e.g. openssl rand -hex 32
 wrangler secret put APNS_PRIVATE_KEY     # paste contents of AuthKey_XXXX.p8
 wrangler secret put APNS_KEY_ID          # e.g. ZRLVNRQ23Q
 wrangler secret put APNS_TEAM_ID         # e.g. F7PJZAN683
@@ -68,6 +68,7 @@ The relay credentials (`installation_id` and `relay_secret`) are populated autom
 | POST | `/v1/update-token` | headers | Update APNs device token |
 | POST | `/v1/push` | headers | Send generic push notification |
 | POST | `/v1/revoke` | headers | Revoke installation |
+| POST | `/v1/rotate-secret` | headers | Move installation to active key version |
 
 ## Auth (header-based, canonical message)
 
@@ -86,7 +87,24 @@ X-ChitNow-Nonce:        <random_hex_min_16_chars>
 X-ChitNow-Signature:    <hmac_sha256_hex_64_chars>
 ```
 
-The `relay_secret` is derived on the Worker as `HMAC-SHA256(RELAY_MASTER_SECRET, installation_id)` — it is never stored. Only the installation_id is stored (with a SHA-256 hash of the relay_secret for audit purposes).
+The `relay_secret` is derived on the Worker as `HMAC-SHA256(RELAY_MASTER_SECRET_V{N}, installation_id)` — it is never stored. Only the installation_id is stored (with a SHA-256 hash of the relay_secret for audit purposes).
+
+## Master-secret rotation
+
+1. Set `RELAY_MASTER_SECRET_V2`.
+2. Set `RELAY_ACTIVE_KEY_VERSION=2` and deploy.
+3. Keep V1 configured while clients migrate. The iPhone requests
+   `/v1/rotate-secret` only while its paired Mac broker is reachable.
+4. After rotation, the previous installation secret remains valid for one hour
+   so a lost response or temporary LAN sync failure can recover.
+
+Before deploying this version over an existing D1 database, run:
+
+```bash
+wrangler d1 execute chitnow-relay --file=migrations/0002_relay_lifecycle.sql
+```
+
+New databases should use `schema.sql` instead.
 
 ## Push body
 
@@ -113,11 +131,12 @@ No command, summary, broker URL, API key, or fingerprint ever passes through the
 
 ## Security
 
-- Each installation's `relay_secret` is derived on demand: `HMAC-SHA256(RELAY_MASTER_SECRET, installation_id)` — never stored
+- Each installation's `relay_secret` is derived on demand from a versioned master secret — never stored
 - All authenticated requests require: valid timestamp (±5 min), valid HMAC, unique nonce (replay rejected with 409)
 - Nonce is consumed ONLY after HMAC verification passes
-- Rate limited: 30 pushes/hour per installation; 5 registrations/hour per IP
-- Registration uses a one-time challenge (`challenge_id` + `nonce`) to prevent enumeration
+- Atomically rate limited: 30 pushes/hour per installation, 10 challenges/hour per IP, and 5 registrations/hour per IP
+- Registration uses a one-time challenge (`challenge_id` + `nonce`) with a unique database claim
+- APNs tokens, installation UUIDs, nonces, signatures, and relay secrets are format validated
 
 ## Running tests
 

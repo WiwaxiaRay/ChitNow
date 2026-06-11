@@ -23,7 +23,6 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
-        NotificationDelegate.shared.registerCategories()
         PhoneSessionManager.shared.activate()
 
         Task {
@@ -53,14 +52,26 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         print("[thenow] device token: \(token.prefix(12))…")
         AppDelegate.deviceToken = token
         Task {
-            await BrokerClient.registerDevice(token: token)
             // Register / update token with relay Worker, then push creds to broker.
             // This handles both the post-pairing first-registration and APNs token rotations.
+            let brokerReachable: Bool
+            if BrokerClient.isPaired {
+                brokerReachable = (await BrokerClient.checkHealth()).reachable
+            } else {
+                brokerReachable = false
+            }
             if let relayURL = KeychainHelper.relayURL, !relayURL.isEmpty,
-               let creds = await RelayClient.registerOrUpdate(deviceToken: token, relayURL: relayURL),
-               BrokerClient.isPaired {
-                await BrokerClient.sendRelayCredentials(installationId: creds.installationId,
-                                                        secret: creds.relaySecret)
+               let creds = await RelayClient.registerOrUpdate(
+                   deviceToken: token,
+                   relayURL: relayURL,
+                   rotateExisting: brokerReachable
+               ),
+               BrokerClient.isPaired,
+               await BrokerClient.sendRelayCredentials(
+                   installationId: creds.installationId,
+                   secret: creds.relaySecret
+               ) {
+                RelayClient.commit(credentials: creds)
             }
         }
     }

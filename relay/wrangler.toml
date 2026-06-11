@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "chitnow-relay"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "058a0c57-e205-485c-97db-1d565294890b"
 
 # Secrets (set with `wrangler secret put`):
 #   APNS_PRIVATE_KEY   — contents of AuthKey_KEYID.p8 (without PEM headers)

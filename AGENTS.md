@@ -79,34 +79,32 @@ curl -sk -X POST https://localhost:8000/approval-requests \
 ```
 Claude Code / Codex
   → thenow_hook.py (PreToolUse / PermissionRequest)
-    → POST /approval-requests          # creates DB record, sends APNs push
+    → POST /approval-requests          # creates DB record, requests generic relay push
     → GET  /wait/{id} (SSE)            # blocks until decision or timeout
         PermissionRequest: 15s timeout → falls back to Codex native UI
         PreToolUse:       180s timeout → denies on expiry
-iPhone receives push → user long-presses → APPROVE/DENY
-  → NotificationDelegate.swift → POST /decision/{id}
+iPhone receives generic push → PhoneSessionManager pings Watch
 Apple Watch polls GET /pending-requests every 5s
   → PendingRequestCard → POST /decision/{id}
 ```
 
 ### Broker (`broker/main.py`)
 
-- SQLite via `aiosqlite` — tables: `devices`, `approval_requests`, `audit_log`
-- APNs via `httpx` HTTP/2 + JWT (`PyJWT`). **Production** endpoint (`api.push.apple.com`). Auth key: `AuthKey_ZRLVNRQ23Q.p8`
-- APNs JWT protected by `asyncio.Lock` (`_apns_lock`) to prevent concurrent regeneration
+- SQLite via `aiosqlite` — tables: `approval_requests`, `audit_log`
+- Relay push via `relay_client.py`; the broker stores per-installation relay credentials in `relay_credentials.json` (600)
 - SSE waiting: in-memory `dict[str, asyncio.Event]` keyed by request ID; orphaned entries cleaned up every 60s in `_ip_monitor`
 - `GET /usage` reads codexbar cache files for token/cost data:
   - `~/Library/Caches/codexbar/cost-usage/claude-v2.json` — daily Claude token rows
   - `~/Library/Caches/codexbar/cost-usage/codex-v8.json` — daily GPT token rows
   - `~/Library/Application Support/com.steipete.codexbar/history/claude.json` — Claude quota
   - `~/Library/Application Support/com.steipete.codexbar/openai-dashboard.json` — GPT quota
-- `GET /broker-ip` returns `{"url": "http://<mac-lan-ip>:8000"}` — **requires auth** (same `X-API-Key` header)
-- `_ip_monitor` background task fires every 60s, pushes new broker URL via APNs on IP change
+- `GET /broker-ip` returns `{"url": "https://<mac-lan-ip>:8000"}` — **requires auth** (same `X-API-Key` header)
+- `_ip_monitor` background task cleans expired SSE waiter objects every 60s
 
 ### iOS app (`thenow/`)
 
-- `thenowApp.swift` — `AppDelegate` registers for APNs, uploads device token to broker; `PhoneSessionManager` activates WCSession and replies to Watch broker-URL requests
-- `NotificationDelegate.swift` — handles `APPROVE`/`DENY` action identifiers from `AGENT_APPROVAL` category, POSTs decision to broker
+- `thenowApp.swift` — `AppDelegate` registers the APNs token with the relay; `PhoneSessionManager` activates WCSession and replies to Watch broker-URL requests
+- `NotificationDelegate.swift` — presents relay notifications while the app is foregrounded
 - `BrokerClient.swift` — uses mDNS hostname (`.local`); calls `GET /broker-ip` and pushes current Mac LAN IP to Watch via `WCSession.updateApplicationContext`
 
 ### Watch App (`thenow Watch App/`)
@@ -130,11 +128,9 @@ Apple Watch polls GET /pending-requests every 5s
 
 | What | Value |
 |------|-------|
-| APNs Key ID | `ZRLVNRQ23Q` |
-| APNs Team ID | `F7PJZAN683` |
 | Bundle ID | `com.wangyang.thenow` |
 | Widget Bundle ID | `com.wangyang.thenow.watchkitapp.ChitNow-Widget-ChitNow-Widget` |
-| APNs env | production (`api.push.apple.com`) |
+| Relay push | generic wake-up only; Worker owns APNs credentials |
 | Broker port | `8000` |
 | Hook timeout (PermissionRequest) | `15s` → falls back to Codex native UI |
 | Hook timeout (PreToolUse) | `180s` → deny |
@@ -143,10 +139,9 @@ Apple Watch polls GET /pending-requests every 5s
 ## Common gotchas
 
 - **Wrong widget file**: `thenow Widget/ThenowWidget.swift` is a dead file not in any build target. The actual widget source is `ChitNow Widget ChitNow Widget/ThenowWidget.swift`.
-- **Watch broker URL**: Watch reads `UserDefaults["brokerURL"]` set by iPhone via WatchConnectivity. The fallback IP in `WatchBrokerClient.swift` is last-resort only — after a network change, the Watch recovers within ~60s as the IP monitor detects the change and pushes the new URL.
+- **Watch broker URL**: Watch reads `UserDefaults["brokerURL"]` set by iPhone via WatchConnectivity. If the Mac LAN IP changes, re-pairing may be required.
 - **mDNS on watchOS**: `.local` hostnames don't resolve reliably in watchOS `URLSession` — Watch always uses direct IP. mDNS is fine for iOS and widget (iPhone process).
-- **APNs BadDeviceToken**: Reopening the iOS app re-registers and uploads a fresh token. Occurs after app reinstall or provisioning changes.
-- **APNs provisioning**: Broker uses production APNs endpoint. Xcode direct-install (development profile) requires switching `APNS_HOST` in `broker/main.py` to `https://api.sandbox.push.apple.com`.
+- **Relay APNs environment**: Production and Xcode development builds use different APNs tokens; configure the Worker environment to match the build being tested.
 - **Codex hook trust**: After editing `~/.codex/config.toml` hooks, re-trust via the `codex` CLI TUI (`/hooks`); the desktop app's panel is read-only.
 - **Quota data stale**: codexbar must be running on Mac to refresh the JSON files the broker reads.
 - **`/broker-ip` requires auth**: All endpoints except `/health` require `X-API-Key` header — including `/broker-ip` (was unauthenticated before, now fixed).

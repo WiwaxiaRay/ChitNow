@@ -17,8 +17,10 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import time
+import uuid
 
 import httpx
 
@@ -27,6 +29,7 @@ RELAY_CREDS_PATH = os.path.join(_DIR, "relay_credentials.json")
 
 _ATTEMPT_TIMEOUT = 6   # seconds per attempt
 _RETRY_DELAYS    = [2, 5, 15]  # seconds before 2nd, 3rd, 4th attempts
+_RELAY_SECRET_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 
 # Push status — updated by push_notification(); read by get_relay_status()
 _last_push_ok: bool = False
@@ -149,6 +152,10 @@ def save_credentials(relay_url: str, installation_id: str, relay_secret: str) ->
     """Write relay credentials to relay_credentials.json (mode 600).
     Called after the iPhone sends credentials back via the pairing confirm endpoint.
     """
+    if str(uuid.UUID(installation_id)) != installation_id.lower():
+        raise ValueError("invalid relay installation_id")
+    if not _RELAY_SECRET_RE.fullmatch(relay_secret):
+        raise ValueError("invalid relay_secret")
     creds = {
         "relay_url": relay_url,
         "installation_id": installation_id,

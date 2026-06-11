@@ -15,11 +15,6 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>THENOW_APNS_ENV</key>
-        <string>production</string>
-    </dict>
     <key>StandardOutPath</key>
     <string>REPO_PATH/broker/broker.log</string>
     <key>StandardErrorPath</key>

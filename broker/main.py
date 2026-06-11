@@ -6,6 +6,7 @@ Run: uvicorn main:app --port 8000
 import asyncio
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -54,6 +55,15 @@ def _load_cert_fingerprint() -> str:
 API_KEY          = _load_api_key()
 CERT_FINGERPRINT = _load_cert_fingerprint()
 
+def _load_pairing_bootstrap_secret() -> str:
+    cfg_path = os.path.join(_DIR, "config.json")
+    try:
+        return json.loads(open(cfg_path).read()).get("pairing_bootstrap_secret", "")
+    except Exception:
+        return ""
+
+PAIRING_BOOTSTRAP_SECRET = _load_pairing_bootstrap_secret()
+
 def _load_relay_url() -> str:
     cfg_path = os.path.join(_DIR, "config.json")
     try:
@@ -71,11 +81,7 @@ _waiters: dict[str, asyncio.Event] = {}
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
-            CREATE TABLE IF NOT EXISTS devices (
-                id TEXT PRIMARY KEY,
-                device_token TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
+            DROP TABLE IF EXISTS devices;
             CREATE TABLE IF NOT EXISTS approval_requests (
                 id TEXT PRIMARY KEY,
                 agent TEXT,
@@ -146,14 +152,11 @@ app = FastAPI(lifespan=lifespan)
 
 
 def auth(x_api_key: str = ""):
-    if x_api_key != API_KEY:
+    if not x_api_key or not secrets.compare_digest(x_api_key, API_KEY):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # ── models ────────────────────────────────────────────────────────────────────
-class DeviceBody(BaseModel):
-    device_token: str
-
 class RequestBody(BaseModel):
     agent: str = "claude-code"
     risk: str = "high"
@@ -174,20 +177,18 @@ class RelayCredentialsBody(BaseModel):
     relay_secret: str
 
 
+_RELAY_SECRET_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+
+
+def _valid_relay_credentials(installation_id: str, relay_secret: str) -> bool:
+    try:
+        canonical_id = str(uuid.UUID(installation_id))
+    except ValueError:
+        return False
+    return canonical_id == installation_id.lower() and bool(_RELAY_SECRET_RE.fullmatch(relay_secret))
+
+
 # ── routes ────────────────────────────────────────────────────────────────────
-@app.post("/register-device")
-async def register_device(body: DeviceBody, x_api_key: str = Header("")):
-    auth(x_api_key)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO devices (id, device_token) VALUES ('default', ?)",
-            (body.device_token,),
-        )
-        await db.commit()
-    print(f"[broker] device registered: {body.device_token[:12]}…")
-    return {"status": "ok"}
-
-
 @app.post("/approval-requests")
 async def create_request(body: RequestBody, x_api_key: str = Header("")):
     auth(x_api_key)
@@ -621,12 +622,16 @@ def _current_https_url() -> str:
 
 
 @app.get("/pair", response_class=HTMLResponse)
-async def pair_page(request: Request):
+async def pair_page(request: Request, setup_token: str = ""):
     """Open in browser on Mac. Shows a one-time QR code for iPhone to scan."""
     # Restrict to localhost
     client_host = request.client.host if request.client else ""
     if client_host not in ("127.0.0.1", "::1"):
         raise HTTPException(status_code=403, detail="Pairing page is only accessible from localhost")
+    if not PAIRING_BOOTSTRAP_SECRET or not secrets.compare_digest(
+        setup_token, PAIRING_BOOTSTRAP_SECRET
+    ):
+        raise HTTPException(status_code=403, detail="Invalid setup token")
     # Expire stale sessions
     now = time.time()
     stale = [k for k, v in _pairing_sessions.items() if v["expires_at"] < now]
@@ -729,8 +734,11 @@ async def pair_confirm(sid: str, body: PairConfirmBody = PairConfirmBody(),
     if time.time() > session["expires_at"]:
         _pairing_sessions.pop(sid, None)
         raise HTTPException(status_code=410, detail="Session expired")
-    if x_pairing_token != session["pairing_token"]:
+    if not secrets.compare_digest(x_pairing_token, session["pairing_token"]):
         raise HTTPException(status_code=401, detail="Invalid pairing token")
+    if ((body.installation_id or body.relay_secret)
+            and not _valid_relay_credentials(body.installation_id, body.relay_secret)):
+        raise HTTPException(status_code=400, detail="Invalid relay credentials")
     session["used"] = True
     # Use broker's own RELAY_URL from local config — never trust relay_url from external input.
     if RELAY_URL and body.installation_id and body.relay_secret:
@@ -751,7 +759,17 @@ async def update_relay_credentials(body: RelayCredentialsBody, x_api_key: str = 
     auth(x_api_key)
     if not RELAY_URL:
         raise HTTPException(status_code=400, detail="Relay not configured on this broker")
+    if not _valid_relay_credentials(body.installation_id, body.relay_secret):
+        raise HTTPException(status_code=400, detail="Invalid relay credentials")
     relay_client.save_credentials(RELAY_URL, body.installation_id, body.relay_secret)
+    return {"status": "ok"}
+
+
+@app.delete("/relay-credentials")
+async def delete_relay_credentials(x_api_key: str = Header("")):
+    """Remove the broker's relay credentials during an authenticated unpair."""
+    auth(x_api_key)
+    relay_client.delete_credentials()
     return {"status": "ok"}
 
 

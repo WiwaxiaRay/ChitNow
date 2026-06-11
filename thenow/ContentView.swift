@@ -7,20 +7,14 @@ struct ContentView: View {
     var body: some View {
         Group {
             if isPaired {
-                ActiveView(onUnpair: {
-                    Task { await RelayClient.revoke() }
-                    KeychainHelper.clear()
-                    isPaired = false
-                })
+                ActiveView(onUnpair: unpair)
             } else {
                 PairingView(onPaired: { isPaired = true })
             }
         }
         .alert("Certificate Changed", isPresented: $showCertAlert) {
             Button("Re-pair Now") {
-                Task { await RelayClient.revoke() }
-                KeychainHelper.clear()
-                isPaired = false
+                unpair()
             }
             Button("Dismiss", role: .cancel) {}
         } message: {
@@ -29,6 +23,20 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .certMismatch)) { _ in
             guard isPaired else { return }
             showCertAlert = true
+        }
+    }
+
+    private func unpair() {
+        let relayCredentials = RelayClient.currentCredentials()
+        Task {
+            if let relayCredentials {
+                _ = await RelayClient.revoke(credentials: relayCredentials)
+            }
+            await BrokerClient.deleteRelayCredentials()
+            await MainActor.run {
+                KeychainHelper.clear()
+                isPaired = false
+            }
         }
     }
 }

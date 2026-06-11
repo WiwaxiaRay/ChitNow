@@ -129,10 +129,10 @@ Hook intercept:
   → POST /approval-requests   (TLS: verify=broker.crt as trust root)
   → GET  /wait/{id} (SSE)     blocks until decision or timeout (~185s PreToolUse, 15s PermissionRequest)
 
-Discovery and notification paths run in parallel (APNs is additive, not exclusive):
+Discovery and notification paths run in parallel:
 
-  APNs path (when .p8 configured):
-      broker → Apple APNs (title, summary, request_id — passes through Apple servers)
+  Relay path (when configured):
+      broker → Cloudflare Worker → Apple APNs (generic wake-up only)
       → iPhone AppDelegate.didReceiveRemoteNotification
         → PhoneSessionManager.pingWatchNewRequest()
           → WCSession.sendMessage (immediate if Watch app in foreground)
@@ -144,24 +144,20 @@ Discovery and notification paths run in parallel (APNs is additive, not exclusiv
   Watch direct polling (always active when Watch app is open):
       every 5s GET /pending-requests → PendingRequestCard
 
-Decision paths:
-  iPhone notification: user long-presses → APPROVE/DENY
-    → NotificationDelegate.swift → BrokerClient.postDecision → POST /decision/{id}
+Decision path:
   Apple Watch: PendingRequestCard → POST /decision/{id}
-  Both send: {"status": "approved" | "denied"}
+  Sends: {"status": "approved" | "denied"}
 
 IP change recovery:
-  With APNs: broker silent push → iPhone updates Keychain + pushes new URL to Watch
-  Without APNs: Watch fetchPending() failure → requestFreshBrokerURL()
+  Watch fetchPending() failure → requestFreshBrokerURL()
     → WCSession sendMessage → iPhone queries /broker-ip (using current Keychain URL)
-    → if Mac IP changed and no APNs, iPhone Keychain URL is also stale → re-pair needed
+    → if Mac IP changed, iPhone Keychain URL is also stale → re-pair needed
 ```
 
 ### Broker (`broker/main.py`)
 
-- SQLite via `aiosqlite` — tables: `devices`, `approval_requests`, `audit_log`
-- APNs via `httpx` HTTP/2 + JWT (`PyJWT`). Endpoint controlled by `THENOW_APNS_ENV` env var: `sandbox` → `api.sandbox.push.apple.com`, `production` (default in launchd plist) → `api.push.apple.com`. Auth key: `AuthKey_ZRLVNRQ23Q.p8`
-- APNs JWT protected by `asyncio.Lock` (`_apns_lock`) to prevent concurrent regeneration
+- SQLite via `aiosqlite` — tables: `approval_requests`, `audit_log`
+- Generic wake-up pushes go through `relay_client.py`; no APNs provider key is stored on the Mac
 - SSE waiting: in-memory `dict[str, asyncio.Event]` keyed by request ID; orphaned entries cleaned up every 60s in `_ip_monitor`
 - `GET /usage` reads codexbar cache files for token/cost data:
   - `~/Library/Caches/codexbar/cost-usage/claude-v2.json` — daily Claude token rows
@@ -169,8 +165,8 @@ IP change recovery:
   - `~/Library/Application Support/com.steipete.codexbar/history/claude.json` — Claude quota
   - `~/Library/Application Support/com.steipete.codexbar/openai-dashboard.json` — GPT quota
 - `GET /broker-ip` returns `{"url": "https://<mac-lan-ip>:8000"}` — requires auth
-- `_ip_monitor` background task fires every 60s, pushes new broker URL via APNs on IP change
-- Pairing endpoints: `GET /pair` (HTML + QR), `POST /pair/{sid}/confirm`, `GET /pair/{sid}/status`
+- `_ip_monitor` background task cleans expired SSE waiter objects every 60s
+- Pairing endpoints: `GET /pair?setup_token=...` (HTML + QR), `POST /pair/{sid}/confirm`, `GET /pair/{sid}/status`
 
 ### iOS app (`thenow/`)
 
@@ -178,7 +174,7 @@ IP change recovery:
 - `PairingView.swift` — QR scanner (`AVCaptureSession`), parses `PairingPayload` (v2: contains pairing token `pt`, not API key), calls `POST /pair/{sid}/confirm` with `X-Pairing-Token` header, receives `api_key` from response, saves to Keychain
 - `BrokerClient.swift` — `PinnedSessionDelegate` pins TLS against stored fingerprint; posts `.certMismatch` notification on mismatch; `discoverAndShareWithWatch()` pushes all three credentials to Watch via `WCSession.updateApplicationContext`
 - `ContentView.swift` — switches between `PairingView` / `ActiveView`; shows cert-mismatch alert; `DiagnosticsView` sheet with live health check
-- `thenowApp.swift` — `AppDelegate` registers for APNs; `PhoneSessionManager.startPolling()` runs every 5s while app is foregrounded, diffs pending request IDs, calls `pingWatchNewRequest()` on new IDs; silent push handler updates iPhone Keychain before pushing new broker URL to Watch
+- `thenowApp.swift` — `AppDelegate` registers the APNs token with the relay; `PhoneSessionManager.startPolling()` runs every 5s while app is foregrounded, diffs pending request IDs, and calls `pingWatchNewRequest()` on new IDs
 
 ### Watch App (`thenow Watch App/`)
 
@@ -199,12 +195,10 @@ IP change recovery:
 
 | What | Value |
 |------|-------|
-| APNs Key ID | `ZRLVNRQ23Q` |
-| APNs Team ID | `F7PJZAN683` |
 | Bundle ID | `com.wangyang.thenow` |
 | Widget Bundle ID | `com.wangyang.thenow.watchkitapp.ChitNow-Widget-ChitNow-Widget` |
 | App Group | `group.com.wangyang.thenow` |
-| APNs env | `THENOW_APNS_ENV` — `production` in launchd plist |
+| Relay push | generic wake-up only; Worker owns APNs credentials |
 | Broker port | `8000` (HTTPS) |
 | Hook timeout (PermissionRequest) | `15s` → falls back to Codex UI |
 | Hook timeout (PreToolUse) | `180s` → deny |
@@ -214,10 +208,9 @@ IP change recovery:
 ## Common gotchas
 
 - **Wrong widget file**: `thenow Widget/ThenowWidget.swift` is dead. Edit `ChitNow Widget ChitNow Widget/ThenowWidget.swift`.
-- **APNs env**: launchd plist sets `THENOW_APNS_ENV=production`. Xcode direct-install (development profile) gets sandbox tokens — switch to `sandbox` or the push will fail with BadDeviceToken.
 - **Cert regeneration**: running `generate_config.py` or deleting `broker/certs/` creates a new cert with a new fingerprint. All paired clients will get `.certMismatch` and must re-pair by scanning the QR again.
 - **App Group entitlements**: Watch App and Widget both require `group.com.wangyang.thenow` in their `.entitlements` files and matching provisioning profiles. Missing entitlement = Widget shows stale/empty data.
-- **Watch broker URL**: Watch reads from App Group `UserDefaults["brokerURL"]`. On network failure, Watch asks iPhone for a fresh URL via WCSession. With APNs, IP changes are pushed automatically (~60s). Without APNs, if Mac IP changes, both Watch and iPhone hold the stale URL — re-pair is usually required.
+- **Watch broker URL**: Watch reads from App Group `UserDefaults["brokerURL"]`. On network failure, Watch asks iPhone for a fresh URL via WCSession. If the Mac IP changed, both may hold a stale URL and re-pairing is usually required.
 - **mDNS on watchOS**: `.local` hostnames don't resolve in watchOS `URLSession` — Watch and Widget always use direct IP.
 - **Codex hook trust**: After editing `~/.codex/config.toml`, re-trust via `codex` CLI TUI (`/hooks`); desktop app panel is read-only.
 - **Quota data stale**: codexbar must be running on Mac to refresh the JSON files the broker reads.

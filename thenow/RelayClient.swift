@@ -33,24 +33,55 @@ enum RelayClient {
     /// Registers the given APNs device token with the relay Worker.
     /// If already registered (Keychain has credentials for this relay URL), updates the token instead.
     /// Returns credentials on success, nil if relay URL is empty or any step fails.
-    static func registerOrUpdate(deviceToken: String, relayURL: String) async -> Credentials? {
-        guard !relayURL.isEmpty else { return nil }
+    static func registerOrUpdate(
+        deviceToken: String,
+        relayURL: String,
+        rotateExisting: Bool = false
+    ) async -> Credentials? {
+        guard isHex64(deviceToken), !relayURL.isEmpty else { return nil }
         let base = relayURL.hasSuffix("/") ? String(relayURL.dropLast()) : relayURL
+        guard let parsed = URL(string: base), parsed.scheme == "https", parsed.host != nil else {
+            print("[relay] refusing non-HTTPS relay URL")
+            return nil
+        }
 
-        // If already registered for this relay URL, just update the token.
+        // Ask the Worker for the active-version secret first. If a rotation
+        // response was previously lost, the old secret remains valid briefly
+        // and this request recovers the new secret.
         if let existing = storedCredentials(for: base) {
-            let ok = await updateToken(deviceToken: deviceToken, credentials: existing)
-            return ok ? existing : nil
+            let active: Credentials
+            if rotateExisting, let rotated = await rotateSecret(credentials: existing) {
+                active = rotated
+            } else {
+                active = existing
+            }
+            let ok = await updateToken(deviceToken: deviceToken, credentials: active)
+            return ok ? active : nil
         }
 
         return await register(deviceToken: deviceToken, base: base)
+    }
+
+    static func currentCredentials() -> Credentials? {
+        guard let url = KeychainHelper.relayURL else { return nil }
+        return storedCredentials(for: url)
+    }
+
+    static func commit(credentials: Credentials) {
+        KeychainHelper.saveRelay(
+            url: credentials.relayURL,
+            installationId: credentials.installationId,
+            secret: credentials.relaySecret
+        )
     }
 
     private static func storedCredentials(for base: String) -> Credentials? {
         guard let storedURL = KeychainHelper.relayURL,
               let id        = KeychainHelper.relayInstallationId,
               let secret    = KeychainHelper.relaySecret,
-              storedURL == base else { return nil }
+              storedURL == base,
+              isValidCredentials(installationId: id, relaySecret: secret)
+        else { return nil }
         return Credentials(relayURL: storedURL, installationId: id, relaySecret: secret)
     }
 
@@ -86,7 +117,8 @@ enum RelayClient {
               (regResp as? HTTPURLResponse)?.statusCode == 201,
               let regJSON = try? JSONDecoder().decode([String: String].self, from: regData),
               let installationId = regJSON["installation_id"],
-              let relaySecret    = regJSON["relay_secret"]
+              let relaySecret    = regJSON["relay_secret"],
+              isValidCredentials(installationId: installationId, relaySecret: relaySecret)
         else {
             print("[relay] register request failed")
             return nil
@@ -134,14 +166,58 @@ enum RelayClient {
         return true
     }
 
+    // MARK: Rotate secret
+
+    private struct RotateResponse: Decodable {
+        let relay_secret: String
+    }
+
+    private static func rotateSecret(credentials: Credentials) async -> Credentials? {
+        guard let url = URL(string: "\(credentials.relayURL)/v1/rotate-secret") else { return nil }
+        let bodyData = Data("{}".utf8)
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = bodyData
+        req.timeoutInterval = 10
+
+        let authHeaders = buildAuthHeaders(
+            method: "POST", path: "/v1/rotate-secret",
+            bodyData: bodyData,
+            installationId: credentials.installationId,
+            relaySecret: credentials.relaySecret
+        )
+        for (k, v) in authHeaders {
+            req.setValue(v, forHTTPHeaderField: k)
+        }
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let rotated = try? JSONDecoder().decode(RotateResponse.self, from: data),
+              isValidCredentials(
+                installationId: credentials.installationId,
+                relaySecret: rotated.relay_secret
+              )
+        else {
+            print("[relay] rotate-secret failed; retaining current credentials")
+            return nil
+        }
+
+        let result = Credentials(
+            relayURL: credentials.relayURL,
+            installationId: credentials.installationId,
+            relaySecret: rotated.relay_secret
+        )
+        return result
+    }
+
     // MARK: Revoke
 
     /// Revoke relay credentials (called on unpair / data delete).
-    static func revoke() async {
-        guard let creds = storedCredentials(for: KeychainHelper.relayURL ?? "") else { return }
-        guard let url = URL(string: "\(creds.relayURL)/v1/revoke") else { return }
+    static func revoke(credentials creds: Credentials) async -> Bool {
+        guard let url = URL(string: "\(creds.relayURL)/v1/revoke") else { return false }
         let bodyDict: [String: String] = [:]
-        guard let bodyData = try? JSONSerialization.data(withJSONObject: bodyDict) else { return }
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: bodyDict) else { return false }
 
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -159,8 +235,14 @@ enum RelayClient {
             req.setValue(v, forHTTPHeaderField: k)
         }
 
-        _ = try? await URLSession.shared.data(for: req)
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200
+        else {
+            print("[relay] revoke failed")
+            return false
+        }
         print("[relay] revoked installation: \(creds.installationId.prefix(8))…")
+        return true
     }
 
     // MARK: Canonical auth headers
@@ -191,6 +273,14 @@ enum RelayClient {
         let keyData = SymmetricKey(data: Data(key.utf8))
         let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: keyData)
         return mac.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func isValidCredentials(installationId: String, relaySecret: String) -> Bool {
+        UUID(uuidString: installationId) != nil && isHex64(relaySecret)
+    }
+
+    private static func isHex64(_ value: String) -> Bool {
+        value.range(of: "^[0-9a-fA-F]{64}$", options: .regularExpression) != nil
     }
 }
 

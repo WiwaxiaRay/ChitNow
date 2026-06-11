@@ -65,11 +65,16 @@ if [ "$PURGE_DATA" = "1" ]; then
     [ -f "$SCRIPT_DIR/broker.db"              ] && rm "$SCRIPT_DIR/broker.db"              && echo "    Removed broker.db"
     [ -f "$SCRIPT_DIR/broker.log"             ] && rm "$SCRIPT_DIR/broker.log"             && echo "    Removed broker.log"
     [ -f "$SCRIPT_DIR/relay_credentials.json" ] && rm "$SCRIPT_DIR/relay_credentials.json" && echo "    Removed relay_credentials.json"
-    echo "    Run data purged."
+    [ -f "$SCRIPT_DIR/config.json"             ] && rm "$SCRIPT_DIR/config.json"             && echo "    Removed config.json"
+    [ -d "$SCRIPT_DIR/certs"                   ] && rm -rf "$SCRIPT_DIR/certs"                && echo "    Removed TLS certificates"
+    for legacy_key in "$SCRIPT_DIR"/AuthKey_*.p8; do
+        [ -f "$legacy_key" ] && rm "$legacy_key" && echo "    Removed legacy APNs private key"
+    done
+    echo "    Run data and local credentials purged."
 else
     echo ""
     echo "    Run data (broker.db, broker.log) kept."
-    echo "    Use --purge-data to delete them."
+    echo "    Use --purge-data to delete them and local credentials."
 fi
 
 echo ""

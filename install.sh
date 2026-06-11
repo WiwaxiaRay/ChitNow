@@ -44,31 +44,34 @@ sed "s|REPO_PATH|$REPO|g" "$REPO/broker/com.wangyang.thenow-broker.plist" > "$PL
 launchctl load "$PLIST_DST"
 echo "    Broker started. Logs: $REPO/broker/broker.log"
 
-# ── 4. Hook script ─────────────────────────────────────────────────────────────
+# ── 4. Health check ────────────────────────────────────────────────────────────
+echo "==> Checking broker health..."
+BROKER_HEALTHY=0
+for _ in {1..10}; do
+    if curl -sk --max-time 2 https://localhost:8000/health >/dev/null; then
+        BROKER_HEALTHY=1
+        break
+    fi
+    sleep 1
+done
+if [ "$BROKER_HEALTHY" -ne 1 ]; then
+    echo "ERROR: Broker failed to start. Check: $REPO/broker/broker.log"
+    exit 1
+fi
+echo "    Broker healthy."
+
+# ── 5. Hook script ─────────────────────────────────────────────────────────────
 echo "==> Installing hook script..."
 mkdir -p "$HOOKS_DIR"
 cp "$REPO/hooks/thenow_hook.py" "$HOOKS_DIR/thenow_hook.py"
 chmod +x "$HOOKS_DIR/thenow_hook.py"
 echo "    Hook installed at $HOOKS_DIR/thenow_hook.py"
 
-# ── 5. Claude Code settings.json ──────────────────────────────────────────────
+# ── 6. Claude Code settings.json ──────────────────────────────────────────────
 echo "==> Wiring Claude Code PreToolUse hook..."
 CONFIG_PATH="$REPO/broker/config.json"
-# Use Python to generate a TOML-safe command value.
-# printf %q produces shell-quoted strings (e.g. 'path with spaces') which are
-# NOT valid TOML strings. Python backslash-escapes for TOML/JSON compatibility.
-HOOK_CMD=$(python3 -c "
-import sys
-def toml_val(s):
-    return s.replace('\\\\', '\\\\\\\\').replace('\"', '\\\\\"')
-parts = [
-    'env',
-    'THENOW_CONFIG_PATH=' + toml_val(sys.argv[1]),
-    toml_val(sys.argv[2]),
-    toml_val(sys.argv[3]),
-]
-print(' '.join(parts))
-" "$CONFIG_PATH" "$REPO/broker/.venv/bin/python" "$HOOKS_DIR/thenow_hook.py")
+HOOK_CMD=$(python3 "$REPO/scripts/generate_hook_command.py" \
+    "$CONFIG_PATH" "$REPO/broker/.venv/bin/python" "$HOOKS_DIR/thenow_hook.py")
 
 if [ ! -f "$SETTINGS" ]; then
     mkdir -p "$(dirname "$SETTINGS")"
@@ -117,15 +120,24 @@ with open(path, "w") as f:
 print("    settings.json updated.")
 PYEOF
 
-# ── 6. Done ────────────────────────────────────────────────────────────────────
-# CODEX_HOOK_CMD is the same as HOOK_CMD — already computed with TOML-safe escaping above.
-CODEX_HOOK_CMD="$HOOK_CMD"
+# ── 7. Done ────────────────────────────────────────────────────────────────────
+CODEX_HOOK_CMD_TOML=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$HOOK_CMD")
+PAIRING_BOOTSTRAP_SECRET=$(
+    "$REPO/broker/.venv/bin/python" -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["pairing_bootstrap_secret"])' \
+    "$CONFIG_PATH"
+)
+RELAY_URL=$(
+    "$REPO/broker/.venv/bin/python" -c \
+    'import json,sys; print(json.load(open(sys.argv[1])).get("relay_url",""))' \
+    "$CONFIG_PATH"
+)
 
 echo ""
 echo "==> Installation complete!"
 echo ""
 echo "Next steps:"
-echo "  1. Open https://localhost:8000/pair in your Mac browser."
+echo "  1. Open https://localhost:8000/pair?setup_token=$PAIRING_BOOTSTRAP_SECRET in your Mac browser."
 echo "     (Accept the certificate warning — it is self-signed and local.)"
 echo "  2. Scan the QR code in the ChitNow app to pair."
 echo ""
@@ -138,7 +150,7 @@ echo "[[hooks.PermissionRequest]]"
 echo "matcher = \"^Bash$\""
 echo "[[hooks.PermissionRequest.hooks]]"
 echo "type = \"command\""
-echo "command = \"$CODEX_HOOK_CMD\""
+echo "command = $CODEX_HOOK_CMD_TOML"
 echo "timeout = 190"
 echo "statusMessage = \"Waiting for Apple Watch approval...\""
 echo ""
@@ -151,4 +163,9 @@ echo "  Merge $REPO/codex/default.rules.example"
 echo "  into ~/.codex/rules/default.rules, then run /hooks"
 echo "  in the Codex TUI to re-trust."
 echo "─────────────────────────────────────────────────────────────"
+if [ -n "$RELAY_URL" ]; then
+    echo "Relay configured: $RELAY_URL"
+else
+    echo "Relay not configured — foreground polling only."
+fi
 echo "To uninstall: bash uninstall.sh"

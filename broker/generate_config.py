@@ -21,21 +21,33 @@ FP_PATH     = os.path.join(CERT_DIR, "fingerprint.txt")
 
 
 def ensure_config() -> dict:
+    requested_relay_url = os.environ.get("CHITNOW_RELAY_URL")
     if os.path.exists(CONFIG_PATH):
         try:
             cfg = json.loads(open(CONFIG_PATH).read())
             if cfg.get("api_key"):
-                # Add relay_url field if missing (idempotent upgrade)
-                if "relay_url" not in cfg:
-                    cfg["relay_url"] = os.environ.get("CHITNOW_RELAY_URL", "")
+                changed = False
+                if requested_relay_url is not None and cfg.get("relay_url") != requested_relay_url:
+                    cfg["relay_url"] = requested_relay_url
+                    changed = True
+                elif "relay_url" not in cfg:
+                    cfg["relay_url"] = ""
+                    changed = True
+                if not cfg.get("pairing_bootstrap_secret"):
+                    cfg["pairing_bootstrap_secret"] = secrets.token_hex(32)
+                    changed = True
+                if changed:
                     with open(CONFIG_PATH, "w") as f:
                         json.dump(cfg, f, indent=2)
                     os.chmod(CONFIG_PATH, 0o600)
                 return cfg
         except Exception:
             pass
-    relay_url = os.environ.get("CHITNOW_RELAY_URL", "")
-    cfg = {"api_key": secrets.token_hex(32), "relay_url": relay_url}
+    cfg = {
+        "api_key": secrets.token_hex(32),
+        "relay_url": requested_relay_url or "",
+        "pairing_bootstrap_secret": secrets.token_hex(32),
+    }
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
     os.chmod(CONFIG_PATH, 0o600)
