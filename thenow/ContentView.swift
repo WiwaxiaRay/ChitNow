@@ -5,14 +5,35 @@ let chitNowWebsiteURL = URL(string: "https://wiwaxiaray.github.io/ChitNowWeb/")!
 struct ContentView: View {
     @State private var isPaired          = KeychainHelper.isConfigured
     @State private var showCertAlert     = false
+    @State private var showSettings      = false
+    @AppStorage("appLanguage") private var language = AppLanguage.english
 
     var body: some View {
-        Group {
-            if isPaired {
-                ActiveView(onUnpair: unpair)
-            } else {
-                PairingView(onPaired: { isPaired = true })
+        ZStack(alignment: .topTrailing) {
+            Group {
+                if isPaired {
+                    ActiveView(onUnpair: unpair)
+                } else {
+                    PairingView(onPaired: { isPaired = true })
+                }
             }
+
+            Button {
+                showSettings = true
+            } label: {
+                Image(systemName: "gearshape.fill")
+                    .font(.title3)
+                    .padding(12)
+                    .background(.thinMaterial, in: Circle())
+            }
+            .accessibilityLabel("Settings")
+            .padding(.top, 8)
+            .padding(.trailing, 16)
+        }
+        .environment(\.locale, language.locale)
+        .sheet(isPresented: $showSettings) {
+            AppSettingsView(language: $language)
+                .environment(\.locale, language.locale)
         }
         .alert("Certificate Changed", isPresented: $showCertAlert) {
             Button("Re-pair Now") {
@@ -172,8 +193,8 @@ struct ActiveView: View {
     }
 
     private func approvalModeButton(
-        title: String,
-        detail: String,
+        title: LocalizedStringKey,
+        detail: LocalizedStringKey,
         systemImage: String,
         enabled: Bool
     ) -> some View {

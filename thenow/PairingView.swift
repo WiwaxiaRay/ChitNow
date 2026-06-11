@@ -123,7 +123,7 @@ struct PairingView: View {
         #endif
     }
 
-    private func disabledApprovalRow(_ title: String, systemImage: String) -> some View {
+    private func disabledApprovalRow(_ title: LocalizedStringKey, systemImage: String) -> some View {
         HStack {
             Image(systemName: systemImage)
                 .frame(width: 24)
