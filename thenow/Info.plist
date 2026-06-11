@@ -2,13 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>NSCameraUsageDescription</key>
-	<string>Used to scan the QR code on your Mac to pair with the approval broker.</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>thenow connects to the local approval broker to send agent approval decisions.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>
+		<string>external-accessory</string>
 	</array>
 </dict>
 </plist>

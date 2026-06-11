@@ -66,9 +66,9 @@ def _load_broker_config() -> tuple[str, str, str | None]:
 
 BROKER_URL, API_KEY, CERT_PATH = _load_broker_config()
 TIMEOUT = 185  # slightly over broker's 180s
-APPROVAL_MODE = os.environ.get("THENOW_APPROVAL_MODE", "strict").lower()
+APPROVAL_MODE = os.environ.get("THENOW_APPROVAL_MODE", "balanced").lower()
 if APPROVAL_MODE not in ("strict", "balanced"):
-    APPROVAL_MODE = "strict"
+    APPROVAL_MODE = "balanced"
 
 # API_KEY is None when config.json cannot be found or has no key.
 # main() checks this and denies rather than falling back to a default.
@@ -211,6 +211,19 @@ def _exit_passthrough() -> None:
     """Not high-risk — let Codex handle with its normal approval UI."""
     sys.exit(0)
 
+def _exit_native_approval(reason: str) -> None:
+    """Return control to the agent's native approval UI."""
+    if _hook_event_name == "PermissionRequest" or _agent == "codex":
+        _exit_passthrough()
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": reason,
+        }
+    }))
+    sys.exit(0)
+
 
 def _exit_allow(message: str = "") -> None:
     """Watch approved — explicitly allow via JSON for PermissionRequest."""
@@ -272,6 +285,31 @@ def main():
         _exit_deny("broker cert not found — re-run install.sh to regenerate certs")
         return
     verify: str = CERT_PATH
+
+    # A user-disabled Watch route falls back to the agent's native approval UI.
+    # Failure to read the authoritative Broker setting still denies by default.
+    try:
+        routing = httpx.get(
+            f"{BROKER_URL}/approval-routing",
+            headers=headers,
+            timeout=5,
+            verify=verify,
+        )
+        routing.raise_for_status()
+        watch_enabled = routing.json().get("watch_approvals_enabled")
+        if not isinstance(watch_enabled, bool):
+            raise ValueError("invalid approval routing response")
+        if not watch_enabled:
+            print("[thenow] Watch approvals disabled — using native approval UI",
+                  file=sys.stderr)
+            _exit_native_approval("Apple Watch approvals are disabled in ChitNow")
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[thenow] approval routing unavailable ({e}) — denying by default",
+              file=sys.stderr)
+        _exit_deny("approval routing unavailable")
+        return
 
     # Create approval request
     try:

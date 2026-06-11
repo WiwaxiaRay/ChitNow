@@ -100,10 +100,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
                 KeychainHelper.save(brokerURL: brokerURL, apiKey: key, certFingerprint: fp)
             }
             if WCSession.isSupported() {
-                var ctx: [String: Any] = ["brokerURL": brokerURL]
-                if let fp = KeychainHelper.certFingerprint { ctx["certFingerprint"] = fp }
-                if let key = KeychainHelper.apiKey          { ctx["apiKey"] = key }
-                try? WCSession.default.updateApplicationContext(ctx)
+                PhoneSessionManager.shared.shareCurrentContextWithWatch(brokerURL: brokerURL)
             }
             completionHandler(.newData)
             return
@@ -146,7 +143,10 @@ class PhoneSessionManager: NSObject, WCSessionDelegate {
     }
 
     private func poll() {
-        guard BrokerClient.isPaired else { return }
+        guard BrokerClient.isPaired, ApprovalRoutingSettings.watchApprovalsEnabled else {
+            seenRequestIDs.removeAll()
+            return
+        }
         Task {
             let ids = await BrokerClient.fetchPendingRequestIDs()
             let idSet = Set(ids)
@@ -169,7 +169,8 @@ class PhoneSessionManager: NSObject, WCSessionDelegate {
     }
 
     func pingWatchNewRequest() {
-        guard WCSession.isSupported(),
+        guard ApprovalRoutingSettings.watchApprovalsEnabled,
+              WCSession.isSupported(),
               WCSession.default.activationState == .activated else { return }
         let session = WCSession.default
         // Immediate delivery when Watch app is in foreground.
@@ -178,6 +179,18 @@ class PhoneSessionManager: NSObject, WCSessionDelegate {
         }
         // Queued delivery — fires when Watch app next becomes active (works from watch face).
         session.transferUserInfo(["ping": "newRequest"])
+    }
+
+    func shareCurrentContextWithWatch(brokerURL: String? = nil) {
+        guard WCSession.isSupported(),
+              WCSession.default.activationState == .activated else { return }
+        var ctx: [String: Any] = [
+            "watchApprovalsEnabled": ApprovalRoutingSettings.watchApprovalsEnabled
+        ]
+        if let url = brokerURL ?? KeychainHelper.brokerURL { ctx["brokerURL"] = url }
+        if let fp = KeychainHelper.certFingerprint { ctx["certFingerprint"] = fp }
+        if let key = KeychainHelper.apiKey { ctx["apiKey"] = key }
+        try? WCSession.default.updateApplicationContext(ctx)
     }
 
     // 手表主动来问时，后台自动回复当前 IP，不需要用户手动开 App
@@ -202,10 +215,7 @@ class PhoneSessionManager: NSObject, WCSessionDelegate {
                 replyHandler([:])
                 return
             }
-            var ctx: [String: Any] = ["brokerURL": brokerURL]
-            if let fp  = KeychainHelper.certFingerprint { ctx["certFingerprint"] = fp }
-            if let key = KeychainHelper.apiKey          { ctx["apiKey"] = key }
-            try? session.updateApplicationContext(ctx)
+            shareCurrentContextWithWatch(brokerURL: brokerURL)
             replyHandler(["brokerURL": brokerURL])
         }
     }

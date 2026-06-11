@@ -47,3 +47,4 @@ xcuserdata/
 .DS_Store
 broker/certs/
 broker/config.json
+broker/config.json.tmp

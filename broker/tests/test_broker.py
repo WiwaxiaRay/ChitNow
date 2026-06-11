@@ -73,6 +73,46 @@ def test_correct_api_key_returns_200(client):
 
 
 # ---------------------------------------------------------------------------
+# Test: approval routing — Broker is authoritative and persists the setting
+# ---------------------------------------------------------------------------
+
+def test_approval_routing_defaults_to_watch_enabled(client, monkeypatch, tmp_path):
+    c, broker_main = client
+    config_path = tmp_path / "routing-config.json"
+    config_path.write_text(json.dumps({"api_key": GOOD_KEY}))
+    monkeypatch.setattr(broker_main, "CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(broker_main, "WATCH_APPROVALS_ENABLED", True)
+
+    r = c.get("/approval-routing", headers=HEADERS)
+    assert r.status_code == 200
+    assert r.json() == {"watch_approvals_enabled": True}
+
+
+def test_approval_routing_update_persists_and_requires_auth(client, monkeypatch, tmp_path):
+    c, broker_main = client
+    config_path = tmp_path / "routing-config.json"
+    config_path.write_text(json.dumps({"api_key": GOOD_KEY, "relay_url": "https://relay.example"}))
+    monkeypatch.setattr(broker_main, "CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(broker_main, "WATCH_APPROVALS_ENABLED", True)
+
+    unauth = c.put("/approval-routing", json={"watch_approvals_enabled": False})
+    assert unauth.status_code == 401
+
+    updated = c.put(
+        "/approval-routing",
+        headers=HEADERS,
+        json={"watch_approvals_enabled": False},
+    )
+    assert updated.status_code == 200
+    assert updated.json() == {"watch_approvals_enabled": False}
+    assert broker_main.WATCH_APPROVALS_ENABLED is False
+    saved = json.loads(config_path.read_text())
+    assert saved["watch_approvals_enabled"] is False
+    assert saved["relay_url"] == "https://relay.example"
+    assert oct(config_path.stat().st_mode)[-3:] == "600"
+
+
+# ---------------------------------------------------------------------------
 # Test: pairing session — 5-minute expiry and single-use
 # ---------------------------------------------------------------------------
 

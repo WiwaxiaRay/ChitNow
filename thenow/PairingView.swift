@@ -38,7 +38,7 @@ struct PairingView: View {
             Text("Pair with Mac")
                 .font(.title2.bold())
 
-            Text("On your Mac, open a browser and visit:\nhttps://localhost:8000/pair\nThen tap the button below to scan the QR code.")
+            Text("Run bash install.sh on your Mac, open the private setup-token URL it prints, then scan the QR code below.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -56,6 +56,11 @@ struct PairingView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .padding(.horizontal, 40)
+            }
+
+            Link(destination: chitNowWebsiteURL) {
+                Label("Website & Setup Guide", systemImage: "safari")
+                    .font(.footnote)
             }
 
             if let err = errorMsg {

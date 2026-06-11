@@ -19,7 +19,7 @@ import aiosqlite
 import relay_client  # noqa: E402 — same-directory module
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 
 # ── vendored assets ───────────────────────────────────────────────────────────
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -29,19 +29,19 @@ with open(os.path.join(_STATIC_DIR, "qrcode.min.js")) as _f:
 # ── config ────────────────────────────────────────────────────────────────────
 _DIR        = os.path.dirname(os.path.abspath(__file__))
 DB_PATH     = os.path.join(_DIR, "broker.db")
+CONFIG_PATH = os.path.join(_DIR, "config.json")
 TIMEOUT_SEC = 180
 
 def _load_api_key() -> str:
     if os.environ.get("THENOW_API_KEY"):
         return os.environ["THENOW_API_KEY"]
-    cfg_path = os.path.join(_DIR, "config.json")
     try:
-        key = json.loads(open(cfg_path).read()).get("api_key", "")
+        key = json.loads(open(CONFIG_PATH).read()).get("api_key", "")
         if not key:
             raise ValueError("api_key missing or empty in config.json")
         return key
     except Exception as e:
-        print(f"[broker] FATAL: cannot load API key from {cfg_path}: {e}", flush=True)
+        print(f"[broker] FATAL: cannot load API key from {CONFIG_PATH}: {e}", flush=True)
         print("[broker] Run: python generate_config.py", flush=True)
         sys.exit(1)
 
@@ -56,22 +56,28 @@ API_KEY          = _load_api_key()
 CERT_FINGERPRINT = _load_cert_fingerprint()
 
 def _load_pairing_bootstrap_secret() -> str:
-    cfg_path = os.path.join(_DIR, "config.json")
     try:
-        return json.loads(open(cfg_path).read()).get("pairing_bootstrap_secret", "")
+        return json.loads(open(CONFIG_PATH).read()).get("pairing_bootstrap_secret", "")
     except Exception:
         return ""
 
 PAIRING_BOOTSTRAP_SECRET = _load_pairing_bootstrap_secret()
 
 def _load_relay_url() -> str:
-    cfg_path = os.path.join(_DIR, "config.json")
     try:
-        return json.loads(open(cfg_path).read()).get("relay_url", "")
+        return json.loads(open(CONFIG_PATH).read()).get("relay_url", "")
     except Exception:
         return ""
 
 RELAY_URL = _load_relay_url()
+
+def _load_watch_approvals_enabled() -> bool:
+    try:
+        return json.loads(open(CONFIG_PATH).read()).get("watch_approvals_enabled", True) is not False
+    except Exception:
+        return True
+
+WATCH_APPROVALS_ENABLED = _load_watch_approvals_enabled()
 
 # ── in-memory SSE waiters ─────────────────────────────────────────────────────
 _waiters: dict[str, asyncio.Event] = {}
@@ -175,6 +181,9 @@ class PairConfirmBody(BaseModel):
 class RelayCredentialsBody(BaseModel):
     installation_id: str
     relay_secret: str
+
+class ApprovalRoutingBody(BaseModel):
+    watch_approvals_enabled: StrictBool
 
 
 _RELAY_SECRET_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
@@ -551,6 +560,34 @@ async def get_usage(x_api_key: str = Header("")):
 @app.get("/health")
 async def health():
     return {"status": "ok", "relay": relay_client.get_relay_status()}
+
+@app.get("/approval-routing")
+async def get_approval_routing(x_api_key: str = Header("")):
+    auth(x_api_key)
+    return {"watch_approvals_enabled": WATCH_APPROVALS_ENABLED}
+
+
+@app.put("/approval-routing")
+async def update_approval_routing(body: ApprovalRoutingBody, x_api_key: str = Header("")):
+    auth(x_api_key)
+    global WATCH_APPROVALS_ENABLED
+    tmp_path = f"{CONFIG_PATH}.tmp"
+    try:
+        cfg = json.loads(open(CONFIG_PATH).read())
+        cfg["watch_approvals_enabled"] = body.watch_approvals_enabled
+        with open(tmp_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, CONFIG_PATH)
+    except Exception as e:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+        print(f"[broker] failed to update approval routing: {type(e).__name__}", flush=True)
+        raise HTTPException(status_code=500, detail="Failed to persist approval routing") from e
+    WATCH_APPROVALS_ENABLED = body.watch_approvals_enabled
+    return {"watch_approvals_enabled": WATCH_APPROVALS_ENABLED}
 
 
 @app.get("/broker-ip")

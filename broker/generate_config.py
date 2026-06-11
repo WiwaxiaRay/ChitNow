@@ -33,6 +33,9 @@ def ensure_config() -> dict:
                 elif "relay_url" not in cfg:
                     cfg["relay_url"] = ""
                     changed = True
+                if "watch_approvals_enabled" not in cfg:
+                    cfg["watch_approvals_enabled"] = True
+                    changed = True
                 if not cfg.get("pairing_bootstrap_secret"):
                     cfg["pairing_bootstrap_secret"] = secrets.token_hex(32)
                     changed = True
@@ -46,6 +49,7 @@ def ensure_config() -> dict:
     cfg = {
         "api_key": secrets.token_hex(32),
         "relay_url": requested_relay_url or "",
+        "watch_approvals_enabled": True,
         "pairing_bootstrap_secret": secrets.token_hex(32),
     }
     with open(CONFIG_PATH, "w") as f:

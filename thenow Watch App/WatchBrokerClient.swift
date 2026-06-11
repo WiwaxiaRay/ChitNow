@@ -20,6 +20,12 @@ enum WatchBrokerClient {
             && sharedDefaults.string(forKey: "apiKey") != nil
         #endif
     }
+    static var watchApprovalsEnabled: Bool {
+        if sharedDefaults.object(forKey: "watchApprovalsEnabled") == nil {
+            return true
+        }
+        return sharedDefaults.bool(forKey: "watchApprovalsEnabled")
+    }
     private static var certFingerprint: String? {
         sharedDefaults.string(forKey: "certFingerprint")
     }

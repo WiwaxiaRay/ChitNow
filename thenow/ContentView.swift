@@ -1,5 +1,7 @@
 import SwiftUI
 
+let chitNowWebsiteURL = URL(string: "https://wiwaxiaray.github.io/ChitNowWeb/")!
+
 struct ContentView: View {
     @State private var isPaired          = KeychainHelper.isConfigured
     @State private var showCertAlert     = false
@@ -47,6 +49,10 @@ struct ActiveView: View {
     var onUnpair: () -> Void
     @State private var showDiagnostics   = false
     @State private var showUnpairConfirm = false
+    @State private var watchApprovalsEnabled = ApprovalRoutingSettings.watchApprovalsEnabled
+    @State private var routingLoaded = false
+    @State private var routingUpdating = false
+    @State private var routingError: String?
 
     var body: some View {
         VStack(spacing: 16) {
@@ -59,6 +65,29 @@ struct ActiveView: View {
 
             Text("Agent approval guard active")
                 .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Use Apple Watch for approvals", isOn: Binding(
+                    get: { watchApprovalsEnabled },
+                    set: { enabled in
+                        Task { await updateApprovalRouting(enabled) }
+                    }
+                ))
+                .disabled(!routingLoaded || routingUpdating)
+
+                Text(watchApprovalsEnabled
+                     ? "High-risk commands wait for approval on Apple Watch."
+                     : "High-risk commands use the native Claude Code or Codex approval screen.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if let routingError {
+                    Text(routingError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+            .padding(.horizontal)
 
             if let url = KeychainHelper.brokerURL {
                 Text(url)
@@ -82,8 +111,14 @@ struct ActiveView: View {
                 .font(.footnote)
             }
             .padding(.top, 4)
+
+            Link(destination: chitNowWebsiteURL) {
+                Label("Website & Setup Guide", systemImage: "safari")
+                    .font(.footnote)
+            }
         }
         .padding()
+        .task { await loadApprovalRouting() }
         .sheet(isPresented: $showDiagnostics) {
             DiagnosticsView()
         }
@@ -92,6 +127,35 @@ struct ActiveView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("You will need to scan the QR code again to reconnect.")
+        }
+    }
+
+    private func loadApprovalRouting() async {
+        let enabled = await BrokerClient.fetchWatchApprovalsEnabled()
+        await MainActor.run {
+            if let enabled {
+                watchApprovalsEnabled = enabled
+                routingError = nil
+            } else {
+                routingError = "Could not load approval routing from Mac."
+            }
+            routingLoaded = true
+        }
+    }
+
+    private func updateApprovalRouting(_ enabled: Bool) async {
+        await MainActor.run {
+            routingUpdating = true
+            routingError = nil
+        }
+        let saved = await BrokerClient.setWatchApprovalsEnabled(enabled)
+        await MainActor.run {
+            if saved {
+                watchApprovalsEnabled = enabled
+            } else {
+                routingError = "Could not update Mac. Approval routing was not changed."
+            }
+            routingUpdating = false
         }
     }
 }

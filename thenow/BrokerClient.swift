@@ -6,6 +6,21 @@ extension Notification.Name {
     static let certMismatch = Notification.Name("thenow.certMismatch")
 }
 
+enum ApprovalRoutingSettings {
+    private static let key = "watchApprovalsEnabled"
+
+    static var watchApprovalsEnabled: Bool {
+        if UserDefaults.standard.object(forKey: key) == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: key)
+    }
+
+    static func setWatchApprovalsEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: key)
+    }
+}
+
 // MARK: - Pinned URLSession
 
 final class PinnedSessionDelegate: NSObject, URLSessionDelegate {
@@ -49,6 +64,10 @@ final class PinnedSessionDelegate: NSObject, URLSessionDelegate {
 // MARK: - BrokerClient
 
 enum BrokerClient {
+    private struct ApprovalRouting: Codable {
+        let watch_approvals_enabled: Bool
+    }
+
     static var brokerURL: String {
         KeychainHelper.brokerURL ?? ""
     }
@@ -102,6 +121,39 @@ enum BrokerClient {
                             body: ["installation_id": installationId, "relay_secret": secret])
     }
 
+    static func fetchWatchApprovalsEnabled() async -> Bool? {
+        guard isPaired, let url = URL(string: "\(brokerURL)/approval-routing") else { return nil }
+        var req = URLRequest(url: url)
+        req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        req.timeoutInterval = 5
+        guard let (data, resp) = try? await makeSession().data(for: req),
+              let http = resp as? HTTPURLResponse,
+              http.statusCode == 200,
+              let routing = try? JSONDecoder().decode(ApprovalRouting.self, from: data)
+        else { return nil }
+        ApprovalRoutingSettings.setWatchApprovalsEnabled(routing.watch_approvals_enabled)
+        return routing.watch_approvals_enabled
+    }
+
+    static func setWatchApprovalsEnabled(_ enabled: Bool) async -> Bool {
+        guard isPaired, let url = URL(string: "\(brokerURL)/approval-routing") else { return false }
+        var req = URLRequest(url: url)
+        req.httpMethod = "PUT"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        req.httpBody = try? JSONEncoder().encode(["watch_approvals_enabled": enabled])
+        req.timeoutInterval = 10
+        guard let (data, resp) = try? await makeSession().data(for: req),
+              let http = resp as? HTTPURLResponse,
+              http.statusCode == 200,
+              let routing = try? JSONDecoder().decode(ApprovalRouting.self, from: data),
+              routing.watch_approvals_enabled == enabled
+        else { return false }
+        ApprovalRoutingSettings.setWatchApprovalsEnabled(enabled)
+        PhoneSessionManager.shared.shareCurrentContextWithWatch()
+        return true
+    }
+
     static func deleteRelayCredentials() async {
         guard isPaired, let url = URL(string: "\(brokerURL)/relay-credentials") else { return }
         var req = URLRequest(url: url)
@@ -126,11 +178,7 @@ enum BrokerClient {
             guard let (data, _) = try? await makeSession().data(for: req),
                   let obj = try? JSONDecoder().decode([String: String].self, from: data),
                   let newURL = obj["url"] else { return }
-            // Push broker URL, API key, and cert fingerprint to Watch
-            var ctx: [String: Any] = ["brokerURL": newURL]
-            if let fp = certFingerprint { ctx["certFingerprint"] = fp }
-            ctx["apiKey"] = apiKey
-            try? WCSession.default.updateApplicationContext(ctx)
+            PhoneSessionManager.shared.shareCurrentContextWithWatch(brokerURL: newURL)
             print("[thenow] Watch context updated: \(newURL)")
         }
     }

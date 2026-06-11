@@ -3,12 +3,14 @@ Security tests for thenow_hook.py.
 
 Covers:
   - TLS cert missing → deny (never verify=False)
+  - default mode: low-risk commands pass through, high-risk commands are intercepted
   - strict mode: all Bash PreToolUse intercepted
   - balanced mode: only high-risk + extra patterns intercepted
 
 Run: cd <repo> && broker/.venv/bin/pytest broker/tests/test_hook_security.py -v
 """
 import json
+import importlib.util
 import os
 import subprocess
 import sys
@@ -68,6 +70,12 @@ def _env_no_api_key(tmp_path) -> dict:
         "THENOW_API_KEY": "",
         "THENOW_BROKER_URL": "",
     }
+
+def _load_hook_module(name: str):
+    spec = importlib.util.spec_from_file_location(name, HOOK)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # ---------------------------------------------------------------------------
@@ -202,16 +210,88 @@ class TestBalancedModeExtraPatterns:
         r = _run(_claude_preuse(command), self._balanced_no_key_env(tmp_path))
         assert r.returncode == 2, f"{command!r} must be intercepted"
 
-    def test_unknown_mode_defaults_to_strict(self, tmp_path):
+    def test_unknown_mode_defaults_to_balanced(self, tmp_path):
         env = {**_env_no_api_key(tmp_path), "THENOW_APPROVAL_MODE": "typo"}
         r = _run(_claude_preuse("echo hello"), env)
-        assert r.returncode == 2
+        assert r.returncode == 0
 
     def test_existing_patterns_still_work_balanced(self, tmp_path):
         """Existing HIGH_RISK_PATTERNS (sudo, rm -rf) still fire in balanced mode."""
         for cmd in ["sudo reboot", "rm -rf /tmp/x"]:
             r = _run(_claude_preuse(cmd), self._balanced_no_key_env(tmp_path))
             assert r.returncode == 2, f"{cmd!r} must be intercepted in balanced mode"
+
+
+class TestDefaultMode:
+    """No THENOW_APPROVAL_MODE: balanced behavior is the usable default."""
+
+    def test_low_risk_commands_pass_through(self, tmp_path):
+        for cmd in ["ls -la", "pwd", "cat README.md"]:
+            r = _run(_claude_preuse(cmd), _env_no_api_key(tmp_path))
+            assert r.returncode == 0, f"{cmd!r} must pass through by default"
+
+    def test_high_risk_commands_are_intercepted(self, tmp_path):
+        for cmd in ["sudo reboot", "rm -rf /tmp/x", "git push origin main"]:
+            r = _run(_claude_preuse(cmd), _env_no_api_key(tmp_path))
+            assert r.returncode == 2, f"{cmd!r} must be intercepted by default"
+
+class TestNativeApprovalFallback:
+    class _RoutingResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"watch_approvals_enabled": False}
+
+    def _prepare(self, monkeypatch, tmp_path, event: str, agent: str):
+        cert = tmp_path / "broker.crt"
+        cert.write_text("test")
+        mod = _load_hook_module(f"thenow_hook_{event}_{agent}")
+        monkeypatch.setattr(mod, "API_KEY", "test-key")
+        monkeypatch.setattr(mod, "CERT_PATH", str(cert))
+        monkeypatch.setattr(mod, "_hook_event_name", event)
+        monkeypatch.setattr(mod, "_agent", agent)
+        monkeypatch.setattr(
+            mod,
+            "_parse_input",
+            lambda: ("sudo reboot", "/tmp", agent, "Bash"),
+        )
+        monkeypatch.setattr(mod.httpx, "get", lambda *args, **kwargs: self._RoutingResponse())
+        monkeypatch.setattr(
+            mod.httpx,
+            "post",
+            lambda *args, **kwargs: pytest.fail("approval request must not be created"),
+        )
+        return mod
+
+    def test_claude_watch_disabled_requests_native_approval(self, monkeypatch, tmp_path, capsys):
+        mod = self._prepare(monkeypatch, tmp_path, "PreToolUse", "claude-code")
+        with pytest.raises(SystemExit) as exc:
+            mod.main()
+        assert exc.value.code == 0
+        output = json.loads(capsys.readouterr().out)
+        decision = output["hookSpecificOutput"]
+        assert decision["hookEventName"] == "PreToolUse"
+        assert decision["permissionDecision"] == "ask"
+
+    def test_codex_watch_disabled_falls_back_without_decision(self, monkeypatch, tmp_path, capsys):
+        mod = self._prepare(monkeypatch, tmp_path, "PermissionRequest", "codex")
+        with pytest.raises(SystemExit) as exc:
+            mod.main()
+        assert exc.value.code == 0
+        assert capsys.readouterr().out == ""
+
+    def test_routing_failure_denies_instead_of_falling_back(self, monkeypatch, tmp_path, capsys):
+        mod = self._prepare(monkeypatch, tmp_path, "PreToolUse", "claude-code")
+        monkeypatch.setattr(
+            mod.httpx,
+            "get",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
+        )
+        with pytest.raises(SystemExit) as exc:
+            mod.main()
+        assert exc.value.code == 2
+        assert "approval routing unavailable" in capsys.readouterr().err
 
 
 class TestCodexRules:

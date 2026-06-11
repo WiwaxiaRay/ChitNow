@@ -55,6 +55,7 @@ struct ContentView: View {
             .onReceive(usageTimer)    { _ in reloadUsage() }
             .onReceive(NotificationCenter.default.publisher(for: .brokerURLUpdated)) { _ in reloadAll() }
             .onReceive(NotificationCenter.default.publisher(for: .newApprovalRequest)) { _ in reloadApprovals() }
+            .onReceive(NotificationCenter.default.publisher(for: .approvalRoutingUpdated)) { _ in reloadApprovals() }
         } else {
             VStack(spacing: 8) {
                 Text("Not Paired")
@@ -76,6 +77,12 @@ struct ContentView: View {
     }
 
     private func reloadApprovals() {
+        guard WatchBrokerClient.watchApprovalsEnabled else {
+            requests = []
+            knownRequestIDs = []
+            dismissedIDs = []
+            return
+        }
         Task {
             let fetched = await WatchBrokerClient.fetchPending()
             let active  = fetched.filter { $0.remainingSeconds > 0 && !dismissedIDs.contains($0.id) }

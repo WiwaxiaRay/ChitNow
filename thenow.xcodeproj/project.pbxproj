@@ -541,6 +541,8 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = thenow/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = thenow;
+				INFOPLIST_KEY_NSCameraUsageDescription = "Used to scan the QR code on your Mac to pair with the approval broker.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "thenow connects to the local approval broker to send agent approval decisions.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -578,6 +580,8 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = thenow/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = thenow;
+				INFOPLIST_KEY_NSCameraUsageDescription = "Used to scan the QR code on your Mac to pair with the approval broker.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "thenow connects to the local approval broker to send agent approval decisions.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

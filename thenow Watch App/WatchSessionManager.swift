@@ -3,6 +3,7 @@ import WatchConnectivity
 extension Notification.Name {
     static let brokerURLUpdated   = Notification.Name("brokerURLUpdated")
     static let newApprovalRequest = Notification.Name("newApprovalRequest")
+    static let approvalRoutingUpdated = Notification.Name("approvalRoutingUpdated")
 }
 
 // Shared App Group suite — widget extension reads from the same suite.
@@ -19,10 +20,9 @@ class WatchSessionManager: NSObject, WCSessionDelegate {
 
     func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {
         guard state == .activated else { return }
-        let ctx = session.receivedApplicationContext
-        if let url = ctx["brokerURL"]       as? String { sharedDefaults.set(url, forKey: "brokerURL") }
-        if let fp  = ctx["certFingerprint"] as? String { sharedDefaults.set(fp,  forKey: "certFingerprint") }
-        if let key = ctx["apiKey"]          as? String { sharedDefaults.set(key, forKey: "apiKey") }
+        DispatchQueue.main.async {
+            self.apply(session.receivedApplicationContext)
+        }
         requestBrokerURLFromPhone(session)
     }
 
@@ -47,9 +47,7 @@ class WatchSessionManager: NSObject, WCSessionDelegate {
 
     func session(_ session: WCSession, didReceiveApplicationContext context: [String: Any]) {
         DispatchQueue.main.async {
-            if let url = context["brokerURL"]       as? String { sharedDefaults.set(url, forKey: "brokerURL") }
-            if let fp  = context["certFingerprint"] as? String { sharedDefaults.set(fp,  forKey: "certFingerprint") }
-            if let key = context["apiKey"]          as? String { sharedDefaults.set(key, forKey: "apiKey") }
+            self.apply(context)
             if context["brokerURL"] != nil {
                 NotificationCenter.default.post(name: .brokerURLUpdated, object: nil)
                 print("[watch] broker context updated")
@@ -58,7 +56,8 @@ class WatchSessionManager: NSObject, WCSessionDelegate {
     }
 
     func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
-        if message["ping"] as? String == "newRequest" {
+        if WatchBrokerClient.watchApprovalsEnabled,
+           message["ping"] as? String == "newRequest" {
             DispatchQueue.main.async {
                 NotificationCenter.default.post(name: .newApprovalRequest, object: nil)
             }
@@ -67,10 +66,21 @@ class WatchSessionManager: NSObject, WCSessionDelegate {
 
     // Handles transferUserInfo delivery — fires even when app was not in foreground.
     func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any]) {
-        if userInfo["ping"] as? String == "newRequest" {
+        if WatchBrokerClient.watchApprovalsEnabled,
+           userInfo["ping"] as? String == "newRequest" {
             DispatchQueue.main.async {
                 NotificationCenter.default.post(name: .newApprovalRequest, object: nil)
             }
+        }
+    }
+
+    private func apply(_ context: [String: Any]) {
+        if let url = context["brokerURL"]       as? String { sharedDefaults.set(url, forKey: "brokerURL") }
+        if let fp  = context["certFingerprint"] as? String { sharedDefaults.set(fp,  forKey: "certFingerprint") }
+        if let key = context["apiKey"]          as? String { sharedDefaults.set(key, forKey: "apiKey") }
+        if let enabled = context["watchApprovalsEnabled"] as? Bool {
+            sharedDefaults.set(enabled, forKey: "watchApprovalsEnabled")
+            NotificationCenter.default.post(name: .approvalRoutingUpdated, object: nil)
         }
     }
 }
