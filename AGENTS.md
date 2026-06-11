@@ -130,7 +130,7 @@ Apple Watch polls GET /pending-requests every 5s
 ### Watch App (`thenow Watch App/`)
 
 - `WatchSessionManager.swift` — `WCSessionDelegate`; all WCSession callbacks dispatch to `DispatchQueue.main` before posting `NotificationCenter` events or writing `UserDefaults` (background-thread safety)
-- `WatchBrokerClient.swift` — reads the complete paired credentials from App Group `UserDefaults`, pins TLS, and caches the last successful `/usage` response for offline display. Simulators do not bypass pairing.
+- `WatchBrokerClient.swift` — requires complete paired credentials from App Group `UserDefaults`, pins TLS, and caches the last successful `/usage` response for offline display. Paired Watch simulators use `localhost` to reach the host Mac but do not bypass pairing.
 - `ContentView.swift` — `TabView` (tag 0=Claude, tag 1=ChatGPT); new-request detection via `knownRequestIDs: Set<String>` inside `reloadApprovals()` on `MainActor` — fires haptic and navigates tab immediately when new IDs are detected; `dismissedIDs` prevents dismissed cards from reappearing on next poll
 - When Watch approval routing is disabled from iPhone, Watch clears approval cards and stops approval polling while usage/widget updates continue
 - `UsageView.swift` — `WatchPageView` renders concentric rings + pixel mascot + terminal block; `PendingRequestCard` uses `CardCountdown: ObservableObject` (held in `@StateObject`) for a stable 1-second countdown — using `private let Timer` on a struct caused the timer to reset every time the parent re-rendered

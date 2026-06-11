@@ -28,9 +28,11 @@ struct PairingView: View {
     @State private var scanning    = false
     @State private var errorMsg:   String?
     @State private var confirming  = false
+    @State private var setupToken  = ""
 
     var body: some View {
-        VStack(spacing: 24) {
+        ScrollView {
+            VStack(spacing: 24) {
             Image(systemName: "qrcode.viewfinder")
                 .font(.system(size: 64))
                 .foregroundStyle(.blue)
@@ -48,6 +50,18 @@ struct PairingView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
+            VStack(alignment: .leading, spacing: 8) {
+                Text("APPROVAL METHOD")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                disabledApprovalRow("Apple Watch", systemImage: "applewatch")
+                disabledApprovalRow("Claude Code / Codex", systemImage: "terminal")
+                Text("Pair with your Mac to choose a method.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 24)
+
             if confirming {
                 ProgressView("Confirming…")
             } else {
@@ -62,6 +76,27 @@ struct PairingView: View {
                 .padding(.horizontal, 40)
             }
 
+            #if targetEnvironment(simulator)
+            VStack(spacing: 10) {
+                TextField("Setup token from install.sh", text: $setupToken)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .textFieldStyle(.roundedBorder)
+
+                Button {
+                    errorMsg = nil
+                    confirming = true
+                    Task { await pairSimulator() }
+                } label: {
+                    Label("Connect This Simulator", systemImage: "desktopcomputer")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(setupToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(.horizontal, 40)
+            #endif
+
             Link(destination: chitNowWebsiteURL) {
                 Label("Website & Setup Guide", systemImage: "safari")
                     .font(.footnote)
@@ -74,14 +109,33 @@ struct PairingView: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
             }
+            }
+            .padding()
         }
-        .padding()
         .sheet(isPresented: $scanning) {
             QRScannerView { result in
                 scanning = false
                 handleScan(result)
             }
         }
+        #if targetEnvironment(simulator)
+        .task { await autoPairSimulatorIfConfigured() }
+        #endif
+    }
+
+    private func disabledApprovalRow(_ title: String, systemImage: String) -> some View {
+        HStack {
+            Image(systemName: systemImage)
+                .frame(width: 24)
+            Text(title)
+                .font(.subheadline.weight(.medium))
+            Spacer()
+            Image(systemName: "lock.fill")
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .foregroundStyle(.secondary)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private func handleScan(_ raw: String) {
@@ -99,6 +153,10 @@ struct PairingView: View {
             errorMsg = "QR code expired — refresh the Mac browser page and try again"
             return
         }
+        beginPairing(payload)
+    }
+
+    private func beginPairing(_ payload: PairingPayload) {
         confirming = true
         Task {
             // Register with relay Worker first (if relay URL is in QR payload)
@@ -131,6 +189,7 @@ struct PairingView: View {
                         KeychainHelper.setRelayURL(relayURL)
                     }
                     UIApplication.shared.registerForRemoteNotifications()
+                    PhoneSessionManager.shared.shareCurrentContextWithWatch()
                     BrokerClient.discoverAndShareWithWatch()
                     onPaired()
                 } else {
@@ -139,6 +198,46 @@ struct PairingView: View {
             }
         }
     }
+
+    #if targetEnvironment(simulator)
+    private func autoPairSimulatorIfConfigured() async {
+        guard !confirming,
+              let token = ProcessInfo.processInfo.environment["THENOW_SETUP_TOKEN"],
+              !token.isEmpty else { return }
+        setupToken = token
+        confirming = true
+        await pairSimulator()
+    }
+
+    private func pairSimulator() async {
+        let token = setupToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        var components = URLComponents(string: "https://localhost:8000/pair/bootstrap")
+        components?.queryItems = [URLQueryItem(name: "setup_token", value: token)]
+        guard let url = components?.url else {
+            await simulatorPairingFailed("Invalid setup token")
+            return
+        }
+        let delegate = SimulatorLocalhostDelegate()
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        do {
+            let (data, response) = try await session.data(from: url)
+            guard (response as? HTTPURLResponse)?.statusCode == 200,
+                  let payload = try? JSONDecoder().decode(PairingPayload.self, from: data) else {
+                await simulatorPairingFailed("Setup token was rejected by the local broker")
+                return
+            }
+            await MainActor.run { beginPairing(payload) }
+        } catch {
+            await simulatorPairingFailed("Could not reach the local broker")
+        }
+    }
+
+    @MainActor
+    private func simulatorPairingFailed(_ message: String) {
+        confirming = false
+        errorMsg = message
+    }
+    #endif
 
     private func confirmWithBroker(payload: PairingPayload,
                                    relayCreds: RelayClient.Credentials?) async -> ConfirmResponse? {
@@ -173,6 +272,24 @@ struct PairingView: View {
         (UIApplication.shared.delegate as? AppDelegate).flatMap { _ in AppDelegate.deviceToken }
     }
 }
+
+#if targetEnvironment(simulator)
+private final class SimulatorLocalhostDelegate: NSObject, URLSessionDelegate {
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        guard challenge.protectionSpace.host == "localhost",
+              challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let trust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(trust: trust))
+    }
+}
+#endif
 
 // MARK: - QRScannerView
 

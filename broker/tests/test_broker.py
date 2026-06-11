@@ -203,6 +203,31 @@ def test_pair_page_requires_setup_token(client):
     assert wrong.status_code == 403
 
 
+def test_pair_bootstrap_returns_structured_payload_for_localhost(client):
+    c, _ = client
+    from starlette.testclient import TestClient as _TC
+    from starlette.types import ASGIApp, Receive, Scope, Send
+    import main as broker_main
+
+    class FakeLocalhostMiddleware:
+        def __init__(self, app: ASGIApp):
+            self.app = app
+        async def __call__(self, scope: Scope, receive: Receive, send: Send):
+            if scope["type"] == "http":
+                scope = dict(scope)
+                scope["client"] = ("127.0.0.1", 54321)
+            await self.app(scope, receive, send)
+
+    with _TC(FakeLocalhostMiddleware(broker_main.app)) as tc:
+        r = tc.get("/pair/bootstrap?setup_token=test-setup-token")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["v"] == 2
+    assert payload["fp"] == broker_main.CERT_FINGERPRINT
+    assert payload["pt"] != "test-setup-token"
+    assert GOOD_KEY not in r.text
+
+
 def test_pair_page_does_not_expose_setup_token_or_api_key(client):
     c, _ = client
     from starlette.testclient import TestClient as _TC

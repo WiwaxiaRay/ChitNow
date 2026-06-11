@@ -3,7 +3,11 @@ import CryptoKit
 
 enum WatchBrokerClient {
     static var baseURL: String {
+        #if targetEnvironment(simulator)
+        return "https://localhost:8000"
+        #else
         return sharedDefaults.string(forKey: "brokerURL") ?? ""
+        #endif
     }
     static var apiKey: String {
         sharedDefaults.string(forKey: "apiKey") ?? ""

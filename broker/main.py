@@ -658,32 +658,21 @@ def _current_https_url() -> str:
     return f"https://{ip}:8000"
 
 
-@app.get("/pair", response_class=HTMLResponse)
-async def pair_page(request: Request, setup_token: str = ""):
-    """Open in browser on Mac. Shows a one-time QR code for iPhone to scan."""
-    # Restrict to localhost
-    client_host = request.client.host if request.client else ""
-    if client_host not in ("127.0.0.1", "::1"):
-        raise HTTPException(status_code=403, detail="Pairing page is only accessible from localhost")
-    if not PAIRING_BOOTSTRAP_SECRET or not secrets.compare_digest(
-        setup_token, PAIRING_BOOTSTRAP_SECRET
-    ):
-        raise HTTPException(status_code=403, detail="Invalid setup token")
-    # Expire stale sessions
+def _new_pairing_payload() -> dict:
     now = time.time()
     stale = [k for k, v in _pairing_sessions.items() if v["expires_at"] < now]
     for k in stale:
         _pairing_sessions.pop(k, None)
 
-    sid          = secrets.token_hex(16)
-    pairing_token = secrets.token_hex(32)   # one-time token; API key never goes in the QR
-    expires_at   = now + 300  # 5 minutes
-    broker_url   = _current_https_url()
+    sid = secrets.token_hex(16)
+    pairing_token = secrets.token_hex(32)
+    expires_at = now + 300
+    broker_url = _current_https_url()
     payload = {
         "v": 2,
         "url": broker_url,
-        "pt":  pairing_token,
-        "fp":  CERT_FINGERPRINT,
+        "pt": pairing_token,
+        "fp": CERT_FINGERPRINT,
         "exp": int(expires_at),
         "sid": sid,
     }
@@ -692,10 +681,36 @@ async def pair_page(request: Request, setup_token: str = ""):
     _pairing_sessions[sid] = {
         "pairing_token": pairing_token,
         "url": broker_url,
-        "fp":  CERT_FINGERPRINT,
+        "fp": CERT_FINGERPRINT,
         "expires_at": expires_at,
         "used": False,
     }
+    return payload
+
+
+def _require_local_setup_token(request: Request, setup_token: str) -> None:
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="Pairing is only accessible from localhost")
+    if not PAIRING_BOOTSTRAP_SECRET or not secrets.compare_digest(
+        setup_token, PAIRING_BOOTSTRAP_SECRET
+    ):
+        raise HTTPException(status_code=403, detail="Invalid setup token")
+
+
+@app.get("/pair/bootstrap")
+async def pair_bootstrap(request: Request, setup_token: str = ""):
+    """Structured localhost-only pairing payload for the iOS Simulator."""
+    _require_local_setup_token(request, setup_token)
+    return _new_pairing_payload()
+
+
+@app.get("/pair", response_class=HTMLResponse)
+async def pair_page(request: Request, setup_token: str = ""):
+    """Open in browser on Mac. Shows a one-time QR code for iPhone to scan."""
+    _require_local_setup_token(request, setup_token)
+    payload = _new_pairing_payload()
+    sid = payload["sid"]
     payload_json = json.dumps(payload)
 
     html = f"""<!DOCTYPE html>
